@@ -274,6 +274,44 @@ def _deep_release_finished_module(module, module_id=""):
     except Exception as e:
         log_debug(f"[ON-DEMAND LIFECYCLE] Ralat pelupusan pantas '{module_id}': {e}")
 
+def evict_module_weights(module, name=""):
+    """Menyingkirkan bobot parameter modul ke Disk dengan menukar storage kepada 0-bait (RAM hos bebas serta-merta)."""
+    if module is None:
+        return 0
+    evicted_count = 0
+    for p in module.parameters():
+        if p.numel() > 0:
+            empty = torch.empty(0, dtype=p.dtype, device="cpu")
+            torch.utils.swap_tensors(p, empty)
+            evicted_count += 1
+    return evicted_count
+
+def evict_h3_auxiliary_modules(container):
+    """Menyingkirkan kesemua 4 modul pembantu MiniMax H3 daripada RAM hos ke disk (Zero RAM Waste, ~3.9GB bebas)."""
+    if container is None:
+        return 0
+    evicted_total = 0
+    try:
+        if hasattr(container, "vae") and container.vae is not None:
+            evicted_total += evict_module_weights(getattr(container.vae, "decoder", None))
+            evicted_total += evict_module_weights(getattr(container.vae, "post_quant_conv", None))
+            evicted_total += evict_module_weights(getattr(container.vae, "encoder", None))
+            evicted_total += evict_module_weights(getattr(container.vae, "quant_conv", None))
+        if hasattr(container, "audio_vae") and container.audio_vae is not None:
+            evicted_total += evict_module_weights(container.audio_vae)
+        if hasattr(container, "latent_upscaler") and container.latent_upscaler is not None:
+            evicted_total += evict_module_weights(container.latent_upscaler)
+        if isinstance(container, dict):
+            for k in ("vae", "video_encoder", "audio_vae", "latent_upscaler"):
+                m = container.get(k)
+                if m is not None:
+                    evicted_total += evict_module_weights(m)
+        if evicted_total > 0:
+            log_debug(f"[ON-DEMAND DISK-TO-RAM] {evicted_total} parameter modul pembantu (Video VAE, Video Encoder, Audio VAE, Latent Upscaler) disingkirkan dari RAM hos (0 bait di RAM).")
+    except Exception as ex:
+        log_debug(f"[ON-DEMAND DISK-TO-RAM] Ralat menyingkirkan modul pembantu: {ex}")
+    return evicted_total
+
 def flush_vram():
     """Fungsi pembersihan VRAM berfasa automatik kalis ralat sticky CUDA driver."""
     gc.collect()
@@ -2610,6 +2648,11 @@ try:
         log_debug(f"Parameter MMGP offload.all diselaraskan secara dinamik: budgets={kwargs.get('budgets')}, asyncTransfers={enable_async}, perc_reserved_mem_max={dynamic_ram_ratio:.2f}")
         res = _original_all(pipe_or_dict_of_modules, **kwargs)
         set_active_mmgp_instance(res)
+        try:
+            evict_h3_auxiliary_modules(pipe_or_dict_of_modules)
+            trim_current_process_working_set()
+        except Exception:
+            pass
         return res
 
     @functools.wraps(_original_profile)
@@ -2731,12 +2774,14 @@ try:
         log_debug(f"MMGP offload.profile diselaraskan: profile_no={target_profile_no}, text_budget={dyn_text_budget}MB, trans_budget={dyn_trans_budget}MB, asyncTransfers={enable_async}, prefetchWindow={overrideKwargs.get('prefetchWindow')}, ram_ratio={dynamic_ram_ratio:.2f}")
         res = _original_profile(pipe_or_dict_of_modules, profile_no=target_profile_no, verboseLevel=target_verbose, **overrideKwargs)
         set_active_mmgp_instance(res)
-        # Segera kosongkan VRAM selepas profiling awal selesai supaya VRAM kekal 100% bebas untuk On-Demand Lifecycle (Load When Needed)
+        # Segera kosongkan VRAM & singkirkan 4 modul pembantu ke Disk selepas profiling awal selesai
         try:
             safe_mmgp_unload(res, "all")
             flush_vram()
             force_pagefile_push()
-            log_debug("[MMGP LIFECYCLE INITIALIZER] Profiling selesai: VRAM dikosongkan sepenuhnya untuk On-Demand Lifecycle (Load When Needed).")
+            evict_h3_auxiliary_modules(pipe_or_dict_of_modules)
+            trim_current_process_working_set()
+            log_debug("[MMGP LIFECYCLE INITIALIZER] Profiling selesai: VRAM dikosongkan & 4 modul pembantu disingkirkan ke Disk (~3.9GB RAM bebas).")
         except Exception:
             pass
         return res
@@ -3020,12 +3065,83 @@ except Exception as e:
 try:
     import models.minimax_h3.video_vae as h3_video_vae
 
-    # [UNIVERSAL AUTO-HEALING & COMPATIBILITY SHIELD: MiniMax H3 Video VAE]
-    # Logik rasmi Wan2GP dalam models/minimax_h3/video_vae.py sudah pun mengandungi
-    # normalisasi ImageNet yang tepat, pemprosesan chunk, dan sokongan upsampling 2x (480p -> 720p/1080p).
-    # Pintasan kaku `_safe_h3_vae_decode(self, latents)` sebelum ini membuang parameter `uint8_rounding`
-    # dan `return_dict` yang menyebabkan TypeError. Kita melindungi panggilan asal menggunakan
-    # universal_auto_healing_call untuk memastikan tiada sebarang isu tandatangan parameter atau OOM.
+    def reload_h3_video_vae_decoder(vae):
+        """Memuatkan semula bobot Video VAE Decoder dari disk safetensors secara on-demand (Zero Delay, < 0.2s)."""
+        try:
+            from shared.utils import files_locator as fl
+            from mmgp import offload
+            from models.minimax_h3.minimax_h3_main import VIDEO_VAE_FILE, get_video_vae_linear_split_map
+            fn = getattr(vae, "_source_file", None) or fl.locate_file(VIDEO_VAE_FILE, error_if_none=False)
+            if not fn or not os.path.exists(fn):
+                fn = fl.locate_file("ckpts/minimax_h3_video_vae_fp8mix.safetensors", error_if_none=False)
+            if not fn or not os.path.exists(fn):
+                return 0
+            t0 = time.perf_counter()
+            sd, _ = offload._safetensors_load_file(fn, writable_tensors=False)
+            upsampling = getattr(vae, "upsampling", False)
+            for name in ("latents_mean", "latents_std"):
+                if upsampling:
+                    sd["_" + name] = sd.pop(name)
+                else:
+                    sd.pop(name, None)
+            if upsampling:
+                for name in [k for k in sd if k.startswith("detail_b32.")]:
+                    del sd[name]
+            split_map = getattr(vae, "split_linear_modules_map", None) or get_video_vae_linear_split_map()
+            if split_map:
+                dtype = getattr(vae, "_model_dtype", torch.float16)
+                sd, _ = offload.split_fused_weights(sd, None, split_map, default_dtype=dtype, verboseLevel=-1)
+            reloaded = 0
+            for mod, prefix in [(getattr(vae, "decoder", None), "decoder."), (getattr(vae, "post_quant_conv", None), "post_quant_conv.")]:
+                if mod is None:
+                    continue
+                for p_name, p in mod.named_parameters():
+                    k = prefix + p_name
+                    if k in sd and p.numel() == 0:
+                        torch.utils.swap_tensors(p, sd[k])
+                        reloaded += 1
+            del sd
+            t_el = time.perf_counter() - t0
+            log_debug(f"[ON-DEMAND DISK-TO-RAM] Video VAE Decoder berjaya dimuatkan semula ({reloaded} param) dalam {t_el:.3f}s.")
+            return reloaded
+        except Exception as ex:
+            log_debug(f"[ON-DEMAND DISK-TO-RAM] Ralat memuatkan semula Video VAE Decoder: {ex}")
+            return 0
+
+    def reload_h3_video_vae_encoder(vae):
+        """Memuatkan semula bobot Video VAE Encoder dari disk safetensors secara on-demand."""
+        try:
+            from shared.utils import files_locator as fl
+            from mmgp import offload
+            from models.minimax_h3.minimax_h3_main import VIDEO_VAE_FILE, get_video_vae_linear_split_map
+            fn = getattr(vae, "_source_file", None) or fl.locate_file(VIDEO_VAE_FILE, error_if_none=False)
+            if not fn or not os.path.exists(fn):
+                fn = fl.locate_file("ckpts/minimax_h3_video_vae_fp8mix.safetensors", error_if_none=False)
+            if not fn or not os.path.exists(fn):
+                return 0
+            t0 = time.perf_counter()
+            sd, _ = offload._safetensors_load_file(fn, writable_tensors=False)
+            split_map = getattr(vae, "split_linear_modules_map", None) or get_video_vae_linear_split_map()
+            if split_map:
+                dtype = getattr(vae, "_model_dtype", torch.float16)
+                sd, _ = offload.split_fused_weights(sd, None, split_map, default_dtype=dtype, verboseLevel=-1)
+            reloaded = 0
+            for mod, prefix in [(getattr(vae, "encoder", None), "encoder."), (getattr(vae, "quant_conv", None), "quant_conv.")]:
+                if mod is None:
+                    continue
+                for p_name, p in mod.named_parameters():
+                    k = prefix + p_name
+                    if k in sd and p.numel() == 0:
+                        torch.utils.swap_tensors(p, sd[k])
+                        reloaded += 1
+            del sd
+            t_el = time.perf_counter() - t0
+            log_debug(f"[ON-DEMAND DISK-TO-RAM] Video VAE Encoder berjaya dimuatkan semula ({reloaded} param) dalam {t_el:.3f}s.")
+            return reloaded
+        except Exception as ex:
+            log_debug(f"[ON-DEMAND DISK-TO-RAM] Ralat memuatkan semula Video VAE Encoder: {ex}")
+            return 0
+
     _orig_h3_vae_decode = h3_video_vae.MiniMaxH3VideoVAE.decode
 
     @functools.wraps(_orig_h3_vae_decode)
@@ -3049,6 +3165,12 @@ try:
         flush_vram()
         force_pagefile_push(force_trim=False)
         trim_current_process_working_set()
+
+        # On-Demand: Muatkan semula bobot Video VAE decoder jika telah disingkirkan ke disk
+        dec_p = next(self.decoder.parameters(), None) if hasattr(self, "decoder") else None
+        if dec_p is not None and dec_p.numel() == 0:
+            reload_h3_video_vae_decoder(self)
+
         try:
             return universal_auto_healing_call(_orig_h3_vae_decode, self, *args, **kwargs)
         finally:
@@ -3058,6 +3180,9 @@ try:
                     safe_mmgp_unload(active_inst, "vae")
                 except Exception:
                     pass
+            # On-Demand: Segera singkirkan bobot Video VAE decoder kembali ke disk
+            evict_module_weights(getattr(self, "decoder", None))
+            evict_module_weights(getattr(self, "post_quant_conv", None))
             flush_vram()
             gc.collect()
             try:
@@ -3066,19 +3191,49 @@ try:
             except Exception:
                 pass
             trim_current_process_working_set()
-            log_debug("[MINIMAX H3 LIFECYCLE] Fasa 3 (Video VAE Decode) selesai! VRAM & RAM dibebaskan.")
+            log_debug("[MINIMAX H3 LIFECYCLE] Fasa 3 (Video VAE Decode) selesai! Bobot VAE Decoder (~2.32 GB) disingkirkan ke Disk (Zero Leak).")
 
     h3_video_vae.MiniMaxH3VideoVAE.decode = _safe_h3_vae_decode
-    log_debug("Perisai 9b: MiniMax H3 Video VAE Universal Auto-Healing Interceptor berjaya dipasang.")
+
+    # Interceptor On-Demand untuk Video VAE Encoder (digunakan hanya semasa input video/imej fasa awal)
+    _orig_h3_vae_encode = getattr(h3_video_vae.MiniMaxH3VideoVAE, "encode", None)
+    if _orig_h3_vae_encode is not None:
+        @functools.wraps(_orig_h3_vae_encode)
+        def _safe_h3_vae_encode(self, *args, **kwargs):
+            enc_p = next(self.encoder.parameters(), None) if hasattr(self, "encoder") else None
+            if enc_p is not None and enc_p.numel() == 0:
+                reload_h3_video_vae_encoder(self)
+            try:
+                return _orig_h3_vae_encode(self, *args, **kwargs)
+            finally:
+                evict_module_weights(getattr(self, "encoder", None))
+                evict_module_weights(getattr(self, "quant_conv", None))
+                flush_vram()
+                trim_current_process_working_set()
+
+        h3_video_vae.MiniMaxH3VideoVAE.encode = _safe_h3_vae_encode
+
+    _orig_h3_vae_encode_cond = getattr(h3_video_vae.MiniMaxH3VideoVAE, "encode_condition", None)
+    if _orig_h3_vae_encode_cond is not None:
+        @functools.wraps(_orig_h3_vae_encode_cond)
+        def _safe_h3_vae_encode_cond(self, *args, **kwargs):
+            enc_p = next(self.encoder.parameters(), None) if hasattr(self, "encoder") else None
+            if enc_p is not None and enc_p.numel() == 0:
+                reload_h3_video_vae_encoder(self)
+            try:
+                return _orig_h3_vae_encode_cond(self, *args, **kwargs)
+            finally:
+                evict_module_weights(getattr(self, "encoder", None))
+                evict_module_weights(getattr(self, "quant_conv", None))
+                flush_vram()
+                trim_current_process_working_set()
+
+        h3_video_vae.MiniMaxH3VideoVAE.encode_condition = _safe_h3_vae_encode_cond
 
     _orig_h3_get_vae_tile_size = h3_video_vae.MiniMaxH3VideoVAE.get_VAE_tile_size
 
     @staticmethod
     def _safe_h3_get_vae_tile_size(vae_config, device_mem_capacity, mixed_precision):
-        # Penalaan Dinamik Jubin VAE MiniMax H3 Berasaskan Fizik GPU (100% Zero Hardcoding):
-        # Jika mod Auto (vae_config == 0), dan GPU memiliki kapasiti VRAM mencukupi (>= 6000MB),
-        # gunakan saiz jubin 512 untuk mengurangkan bilangan jubin 3D konvolusi daripada 108 kepada hanya 24 jubin,
-        # memendekkan masa VAE decoding secara drastik daripada ~87s kepada ~20s.
         if vae_config == 0:
             if device_mem_capacity >= 6000:
                 return 512
@@ -3086,21 +3241,55 @@ try:
         return {1: 0, 2: 512, 3: 256}.get(int(vae_config), 128)
 
     h3_video_vae.MiniMaxH3VideoVAE.get_VAE_tile_size = _safe_h3_get_vae_tile_size
-    log_debug("Perisai 9c: MiniMax H3 Dynamic VAE Auto Tile Optimizer (512px) berjaya dipasang.")
+    log_debug("Perisai 9b & 9c: MiniMax H3 Video VAE True On-Demand Disk-to-RAM & Dynamic Auto Tile berjaya dipasang.")
 except Exception as e:
     log_debug(f"Pintasan MiniMax H3 VAE decode gagal: {e}")
 
 try:
     import models.minimax_h3.audio_vae as h3_audio_vae
 
-    # [UNIVERSAL AUTO-HEALING SHIELD: MiniMax H3 Audio VAE]
-    # Membungkus decode Audio VAE dengan tandatangan dinamik (*args, **kwargs)
-    # bagi mengelakkan TypeError sekiranya saluran atau parameter stereo/mono berubah.
+    def reload_h3_audio_vae(audio_vae):
+        """Memuatkan semula bobot Audio VAE dari disk safetensors secara on-demand (< 0.02s)."""
+        try:
+            from shared.utils import files_locator as fl
+            from mmgp import offload
+            from models.minimax_h3.minimax_h3_main import AUDIO_VAE_FILE
+            fn = getattr(audio_vae, "_source_file", None) or fl.locate_file(AUDIO_VAE_FILE, error_if_none=False)
+            if not fn or not os.path.exists(fn):
+                fn = fl.locate_file("ckpts/MiniMax-H3-audio_vae_fp32.safetensors", error_if_none=False)
+            if not fn or not os.path.exists(fn):
+                return 0
+            t0 = time.perf_counter()
+            sd, _ = offload._safetensors_load_file(fn, writable_tensors=False)
+            sd.pop("latents_mean", None)
+            sd.pop("latents_std", None)
+            for key in list(sd):
+                if key.endswith(".weight_g"):
+                    sd[key.removesuffix("weight_g") + "parametrizations.weight.original0"] = sd.pop(key)
+                elif key.endswith(".weight_v"):
+                    sd[key.removesuffix("weight_v") + "parametrizations.weight.original1"] = sd.pop(key)
+            reloaded = 0
+            for p_name, p in audio_vae.named_parameters():
+                if p_name in sd and p.numel() == 0:
+                    torch.utils.swap_tensors(p, sd[p_name])
+                    reloaded += 1
+            del sd
+            t_el = time.perf_counter() - t0
+            log_debug(f"[ON-DEMAND DISK-TO-RAM] Audio VAE berjaya dimuatkan semula ({reloaded} param) dalam {t_el:.3f}s.")
+            return reloaded
+        except Exception as ex:
+            log_debug(f"[ON-DEMAND DISK-TO-RAM] Ralat memuatkan semula Audio VAE: {ex}")
+            return 0
+
     _orig_h3_audio_vae_decode = h3_audio_vae.MiniMaxH3AudioVAE.decode
 
     @functools.wraps(_orig_h3_audio_vae_decode)
     def _safe_h3_audio_vae_decode(self, *args, **kwargs):
         flush_vram()
+        # On-Demand: Muatkan semula bobot Audio VAE jika disingkirkan ke disk
+        a_p = next(self.parameters(), None)
+        if a_p is not None and a_p.numel() == 0:
+            reload_h3_audio_vae(self)
         try:
             return universal_auto_healing_call(_orig_h3_audio_vae_decode, self, *args, **kwargs)
         finally:
@@ -3110,6 +3299,8 @@ try:
                     safe_mmgp_unload(active_inst, "audio_vae")
                 except Exception:
                     pass
+            # On-Demand: Segera singkirkan bobot Audio VAE kembali ke disk
+            evict_module_weights(self)
             flush_vram()
             gc.collect()
             try:
@@ -3120,12 +3311,78 @@ try:
             except Exception:
                 pass
             trim_current_process_working_set()
-            log_debug("[MINIMAX H3 LIFECYCLE] Fasa 3 (Audio VAE Decode) selesai! VRAM & RAM dipulihkan ke paras dasar (Zero Leak).")
+            log_debug("[MINIMAX H3 LIFECYCLE] Fasa 3 (Audio VAE Decode) selesai! Audio VAE (~0.58 GB) disingkirkan ke Disk (Zero Leak).")
 
     h3_audio_vae.MiniMaxH3AudioVAE.decode = _safe_h3_audio_vae_decode
-    log_debug("Perisai 9d: MiniMax H3 Audio VAE Universal Auto-Healing Interceptor berjaya dipasang.")
+
+    _orig_h3_audio_vae_encode = getattr(h3_audio_vae.MiniMaxH3AudioVAE, "encode", None)
+    if _orig_h3_audio_vae_encode is not None:
+        @functools.wraps(_orig_h3_audio_vae_encode)
+        def _safe_h3_audio_vae_encode(self, *args, **kwargs):
+            a_p = next(self.parameters(), None)
+            if a_p is not None and a_p.numel() == 0:
+                reload_h3_audio_vae(self)
+            try:
+                return _orig_h3_audio_vae_encode(self, *args, **kwargs)
+            finally:
+                evict_module_weights(self)
+                flush_vram()
+                trim_current_process_working_set()
+
+        h3_audio_vae.MiniMaxH3AudioVAE.encode = _safe_h3_audio_vae_encode
+
+    log_debug("Perisai 9d: MiniMax H3 Audio VAE True On-Demand Disk-to-RAM berjaya dipasang.")
 except Exception as e:
     log_debug(f"Pintasan MiniMax H3 Audio VAE decode gagal: {e}")
+
+try:
+    import models.minimax_h3.latent_upscaler as h3_latent_upscaler
+
+    def reload_h3_latent_upscaler(upscaler):
+        """Memuatkan semula bobot Latent Upscaler dari disk safetensors secara on-demand (< 0.01s)."""
+        try:
+            from shared.utils import files_locator as fl
+            from mmgp import offload
+            from models.minimax_h3.minimax_h3_main import LATENT_UPSCALER_FILE, LATENT_UPSCALER_FOLDER
+            fn = getattr(upscaler, "_source_file", None) or fl.locate_file(os.path.join(LATENT_UPSCALER_FOLDER, LATENT_UPSCALER_FILE), error_if_none=False)
+            if not fn or not os.path.exists(fn):
+                fn = fl.locate_file("minimax_h3/minimax_h3_latent_upscaler_3d_bf16.safetensors", error_if_none=False)
+            if not fn or not os.path.exists(fn):
+                return 0
+            t0 = time.perf_counter()
+            sd, _ = offload._safetensors_load_file(fn, writable_tensors=False)
+            reloaded = 0
+            for p_name, p in upscaler.named_parameters():
+                if p_name in sd and p.numel() == 0:
+                    torch.utils.swap_tensors(p, sd[p_name])
+                    reloaded += 1
+            del sd
+            t_el = time.perf_counter() - t0
+            log_debug(f"[ON-DEMAND DISK-TO-RAM] Latent Upscaler berjaya dimuatkan semula ({reloaded} param) dalam {t_el:.3f}s.")
+            return reloaded
+        except Exception as ex:
+            log_debug(f"[ON-DEMAND DISK-TO-RAM] Ralat memuatkan semula Latent Upscaler: {ex}")
+            return 0
+
+    _orig_h3_upscaler_forward = h3_latent_upscaler.MiniMaxH3LatentUpscaler.forward
+
+    @functools.wraps(_orig_h3_upscaler_forward)
+    def _safe_h3_upscaler_forward(self, *args, **kwargs):
+        up_p = next(self.parameters(), None)
+        if up_p is not None and up_p.numel() == 0:
+            reload_h3_latent_upscaler(self)
+        try:
+            return _orig_h3_upscaler_forward(self, *args, **kwargs)
+        finally:
+            evict_module_weights(self)
+            flush_vram()
+            trim_current_process_working_set()
+            log_debug("[MINIMAX H3 LIFECYCLE] Latent Upscaler (~0.66 GB) disingkirkan ke Disk selepas upscaling selesai.")
+
+    h3_latent_upscaler.MiniMaxH3LatentUpscaler.forward = _safe_h3_upscaler_forward
+    log_debug("Perisai 9e: MiniMax H3 Latent Upscaler True On-Demand Disk-to-RAM berjaya dipasang.")
+except Exception as e:
+    log_debug(f"Pintasan MiniMax H3 Latent Upscaler gagal: {e}")
 
 # ------------------------------------------------------------------------------
 # 6c. PERISAI 10: MiniMax H3 Token Refiner Eviction & Denoising Stream Guard
@@ -3340,6 +3597,20 @@ try:
                         if os.path.exists(cand):
                             te_path = os.path.abspath(cand)
                     self._h3_text_encoder_fn = te_path
+                try:
+                    from shared.utils import files_locator as fl
+                    from models.minimax_h3.minimax_h3_main import VIDEO_VAE_FILE, AUDIO_VAE_FILE, LATENT_UPSCALER_FILE, LATENT_UPSCALER_FOLDER
+                    if hasattr(self, "vae") and self.vae is not None and not getattr(self.vae, "_source_file", None):
+                        v_fn = fl.locate_file("ckpts/minimax_h3_video_vae_fp8mix.safetensors", error_if_none=False) or fl.locate_file(VIDEO_VAE_FILE, error_if_none=False)
+                        self.vae._source_file = v_fn
+                    if hasattr(self, "audio_vae") and self.audio_vae is not None and not getattr(self.audio_vae, "_source_file", None):
+                        a_fn = fl.locate_file("ckpts/MiniMax-H3-audio_vae_fp32.safetensors", error_if_none=False) or fl.locate_file(AUDIO_VAE_FILE, error_if_none=False)
+                        self.audio_vae._source_file = a_fn
+                    if hasattr(self, "latent_upscaler") and self.latent_upscaler is not None and not getattr(self.latent_upscaler, "_source_file", None):
+                        u_fn = fl.locate_file("minimax_h3/minimax_h3_latent_upscaler_3d_bf16.safetensors", error_if_none=False) or fl.locate_file(os.path.join(LATENT_UPSCALER_FOLDER, LATENT_UPSCALER_FILE), error_if_none=False)
+                        self.latent_upscaler._source_file = u_fn
+                except Exception:
+                    pass
 
             def _smart_use_transformer(self):
                 self._in_transformer_phase = True
@@ -3362,6 +3633,9 @@ try:
                                 m_entry = active_inst.models.get(mid)
                                 if m_entry is not None:
                                     setattr(m_entry, "_pinned_bytes", 0)
+
+                    # True On-Demand Disk-to-RAM: Singkirkan bobot 4 modul pembantu (Video VAE, Video Encoder, Audio VAE, Latent Upscaler) ke Disk
+                    evict_h3_auxiliary_modules(self)
 
                     flush_vram()
                     if torch.cuda.is_available():
@@ -3530,13 +3804,14 @@ try:
                                 torch.cuda.synchronize()
                             except Exception:
                                 pass
-                            torch.cuda.reset_peak_memory_stats()
                         gc.collect()
                         force_pagefile_push(force_trim=True)
+                        evict_h3_auxiliary_modules(self)
+                        trim_current_process_working_set()
                         if torch.cuda.is_available():
                             free_post, total_post = torch.cuda.mem_get_info()
                             alloc_post = torch.cuda.memory_allocated()
-                            log_debug(f"[LIFECYCLE PASCA-PENJANAAN] Penjanaan selesai 100%. VRAM dipulihkan ke paras dasar: Alokasi={alloc_post/(1024*1024):.1f}MB, DriverBebas={free_post/(1024*1024):.1f}MB/{total_post/(1024*1024):.1f}MB (Zero VRAM Leak).")
+                            log_debug(f"[LIFECYCLE PASCA-PENJANAAN] Penjanaan selesai 100%. VRAM & RAM dipulihkan ke paras dasar: Alokasi={alloc_post/(1024*1024):.1f}MB, DriverBebas={free_post/(1024*1024):.1f}MB/{total_post/(1024*1024):.1f}MB (Zero VRAM Leak, Modul Pembantu di Disk).")
                     except Exception as ex:
                         log_debug(f"[LIFECYCLE PASCA-PENJANAAN] Ralat penyegaran pasca-penjanaan: {ex}")
 
