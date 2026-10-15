@@ -3309,11 +3309,17 @@ try:
             def _patched_pipe_init(self, *args, **kwargs):
                 _orig_pipe_init(self, *args, **kwargs)
                 if not getattr(self, "_h3_text_encoder_fn", None):
-                    import shared.file_locator as fl
+                    te_path = None
                     try:
-                        self._h3_text_encoder_fn = fl.locate_file("ckpts/Qwen3-VL-32B-Instruct/qwen3vl-32B-MiniMax-H3-Q4_K_M.gguf")
+                        from shared.utils import files_locator as fl
+                        te_path = fl.locate_file("ckpts/Qwen3-VL-32B-Instruct/qwen3vl-32B-MiniMax-H3-Q4_K_M.gguf", error_if_none=False)
                     except Exception:
-                        self._h3_text_encoder_fn = None
+                        pass
+                    if not te_path:
+                        cand = os.path.join("ckpts", "Qwen3-VL-32B-Instruct", "qwen3vl-32B-MiniMax-H3-Q4_K_M.gguf")
+                        if os.path.exists(cand):
+                            te_path = os.path.abspath(cand)
+                    self._h3_text_encoder_fn = te_path
 
             def _smart_use_transformer(self):
                 self._in_transformer_phase = True
@@ -3426,9 +3432,16 @@ try:
                                 quant_router.register_file_extension('gguf', gguf_handler)
                                 from models.minimax_h3.minimax_h3_main import _load_text_encoder
                                 te_fn = getattr(self, "_h3_text_encoder_fn", None)
-                                if not te_fn:
-                                    import shared.file_locator as fl
-                                    te_fn = fl.locate_file("ckpts/Qwen3-VL-32B-Instruct/qwen3vl-32B-MiniMax-H3-Q4_K_M.gguf")
+                                if not te_fn or not os.path.exists(te_fn):
+                                    try:
+                                        from shared.utils import files_locator as fl
+                                        te_fn = fl.locate_file("ckpts/Qwen3-VL-32B-Instruct/qwen3vl-32B-MiniMax-H3-Q4_K_M.gguf", error_if_none=False)
+                                    except Exception:
+                                        pass
+                                    if not te_fn or not os.path.exists(te_fn):
+                                        cand = os.path.join("ckpts", "Qwen3-VL-32B-Instruct", "qwen3vl-32B-MiniMax-H3-Q4_K_M.gguf")
+                                        if os.path.exists(cand):
+                                            te_fn = os.path.abspath(cand)
                                 if te_fn and os.path.exists(te_fn):
                                     t0_reload = time.perf_counter()
                                     self.text_encoder = _load_text_encoder(te_fn, self.dtype)
