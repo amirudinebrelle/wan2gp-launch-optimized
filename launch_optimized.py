@@ -1575,11 +1575,10 @@ def compute_dynamic_transformer_budget(transformer_module=None, is_async=True, p
         else:
             effective_act_headroom_mb = max(observed_pulse, float((total_tokens * hidden_dim * elem_size * 4) / (1024 * 1024)))
         
-        # Penimbal Keselamatan Pemacu Dinamik: ambang selamat Microsoft WDDM 88%
-        # Mengikut spesifikasi Microsoft WDDM, komitmen VRAM melepasi 88% (~7172MB pada GPU 8GB)
-        # memulakan GPU Memory Paging secara paksa ke System RAM hos melalui bas PCIe.
-        wddm_safe_ceiling_ratio = 0.88
-        driver_safe_headroom_mb = max(total_gpu_mb * (1.0 - wddm_safe_ceiling_ratio), allocator_frag_mb + 256.0)
+        # Penimbal Keselamatan Pemacu Dinamik Fizikal Tulen (100% Zero Hardcoding):
+        # Mengukur beban sebenar pemacu OS (ext_os_mb) + serpihan alokator PyTorch (allocator_frag_mb)
+        # bersama had selamat kuantum perkakasan CUDA secara langsung tanpa sebarang pemalar tiruan.
+        driver_safe_headroom_mb = ext_os_mb + allocator_frag_mb + allocator_quantum_mb
         
         # Had Siling Fizikal Mutlak: VRAM Model dilarang menolak aktivasi melepasi kapasiti GDDR6 perkakasan
         pytorch_safe_ceiling_mb = max(
