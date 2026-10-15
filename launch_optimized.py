@@ -226,15 +226,24 @@ def force_pagefile_push(min_interval=0.5, force_trim=False):
             pass
 
 def trim_current_process_working_set():
-    """Membebaskan halaman fail mmap dorman (seperti 18GB Text Encoder) daripada set kerja RAM proses semasa serta-merta (0.25 ms)."""
+    """Membebaskan halaman fail mmap dorman (seperti 14GB Text Encoder) daripada set kerja RAM proses semasa serta-merta (0.25 ms)."""
     if sys.platform == "win32":
         try:
             import ctypes
+            from ctypes import wintypes
             psapi = ctypes.WinDLL('psapi.dll')
             kernel32 = ctypes.WinDLL('kernel32.dll')
-            psapi.EmptyWorkingSet(kernel32.GetCurrentProcess())
-        except Exception:
-            pass
+            kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+            psapi.EmptyWorkingSet.argtypes = [wintypes.HANDLE]
+            psapi.EmptyWorkingSet.restype = wintypes.BOOL
+            h_proc = kernel32.GetCurrentProcess()
+            ok = psapi.EmptyWorkingSet(h_proc)
+            if ok:
+                log_debug("[WIN32 MEMORY TRIM] Working set RAM proses berjaya dipangkas bersih ke sistem.")
+            else:
+                log_debug(f"[WIN32 MEMORY TRIM] Gagal memangkas working set: Kod Ralat {kernel32.GetLastError()}")
+        except Exception as e:
+            log_debug(f"[WIN32 MEMORY TRIM] Ralat ctypes semasa memangkas: {e}")
 
 def _deep_release_finished_module(module, module_id=""):
     """Pelepasan pantas modul selesai (Fasa Tamat) secara on-demand tanpa halangan I/O atau KeyError."""
