@@ -4521,7 +4521,7 @@ def main():
             except Exception:
                 pass
 
-            # B. Bersihkan gen_cache dan shared_state secara selamat
+            # B. Bersihkan gen_cache, shared_state, KV cache & penimbal model MiniMax H3
             try:
                 if hasattr(main_module, "clear_gen_cache"):
                     try:
@@ -4534,6 +4534,21 @@ def main():
                         _m_off.shared_state.clear()
                     except Exception:
                         pass
+            except Exception:
+                pass
+
+            # Kosongkan penimbal KV MiniMax H3 global & atribut konteks pipeline
+            try:
+                if "_h3_persistent_kv" in globals():
+                    for k in list(_h3_persistent_kv.keys()):
+                        _h3_persistent_kv[k] = None
+                wm = getattr(main_module, "wan_model", None)
+                if wm is not None:
+                    for attr in ("text_encoder_cache", "_current_context", "_current_video"):
+                        if hasattr(wm, attr):
+                            cache_o = getattr(wm, attr)
+                            if hasattr(cache_o, "clear"):
+                                cache_o.clear()
             except Exception:
                 pass
 
@@ -4553,9 +4568,15 @@ def main():
             gc.collect()
             if torch.cuda.is_available():
                 try:
-                    torch.cuda.empty_cache()
+                    if "_orig_cuda_empty_cache" in globals():
+                        _orig_cuda_empty_cache()
+                    else:
+                        torch.cuda.empty_cache()
                 except Exception:
-                    pass
+                    try:
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
                 try:
                     torch.cuda.ipc_collect()
                 except Exception:
@@ -4650,21 +4671,23 @@ def main():
         patched_code = patched_code.replace(target_clean_exit, replacement_clean_exit)
         log_debug("Perisai Pembersihan Pasca-Penjanaan (Pasca-Gen Deep Clean) berjaya disuntik.")
 
-    # Suntikan 3: Pembersihan Pasca-Batal / Pasca-Ralat
-    target_abort_clean = '''                offloadobj.unload_all()
-                trans.cache = None '''
+    # Suntikan 3: Pembersihan Pasca-Batal / Pasca-Ralat (Dijalankan selepas exc.__traceback__ dipadamkan)
+    target_abort_exit = '''                send_cmd("error", new_error)
+                clear_status(state)
+                return False'''
 
-    replacement_abort_clean = '''                offloadobj.unload_all()
-                trans.cache = None 
+    replacement_abort_exit = '''                send_cmd("error", new_error)
+                clear_status(state)
                 try:
                     if "_universal_deep_clean_memory" in globals():
                         globals()["_universal_deep_clean_memory"]("PASCA-BATAL/RALAT")
                 except Exception:
-                    pass'''
+                    pass
+                return False'''
 
-    if target_abort_clean in patched_code:
-        patched_code = patched_code.replace(target_abort_clean, replacement_abort_clean, 1)
-        log_debug("Perisai Pembersihan Pasca-Batal/Ralat berjaya disuntik.")
+    if target_abort_exit in patched_code:
+        patched_code = patched_code.replace(target_abort_exit, replacement_abort_exit, 1)
+        log_debug("Perisai Pembersihan Pasca-Batal/Ralat (Terminal Abort Clean) berjaya disuntik.")
 
     # Suntikan 4: Perisai Gradio NoneType Guard (Anti-Spam TypeError Console)
     target_enhancer = '''def refresh_prompt_enhancer_labels(state, metadata, *, tab_id="generate"):
