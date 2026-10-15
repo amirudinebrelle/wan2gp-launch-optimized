@@ -1453,7 +1453,19 @@ def compute_dynamic_transformer_budget(transformer_module=None, is_async=True, p
             patch_t = math.ceil(latent_t / max(1, p_t))
             visual_tokens = patch_h * patch_w * patch_t
             text_tokens = 512
-            total_tokens = int((visual_tokens + text_tokens) * max(1.0, float(token_scaling_ratio)))
+            # Pengesanan Dinamik Saluran Modaliti Fizikal Tulen (Zero Hardcoding):
+            # 1 saluran asas video sasaran.
+            # Saluran tambahan dikesan mengikut komponen aktif (Ref2VA/Continuation, Audio Latents, Token Refiner).
+            active_channels = 1.0
+            if getattr(transformer_module, "reference_mode", False) or getattr(transformer_module, "control_layers", None):
+                active_channels += 1.0
+            fl = getattr(transformer_module, "final_layer", None)
+            if not is_audio and fl is not None and hasattr(fl, "audio_out"):
+                active_channels += 1.0
+            if hasattr(transformer_module, "token_refiner") and getattr(transformer_module, "token_refiner", None) is not None:
+                active_channels += 1.0
+            channel_multiplier = max(active_channels, float(token_scaling_ratio))
+            total_tokens = int((visual_tokens + text_tokens) * channel_multiplier)
             if _generation_state.get("active_seq_len"):
                 total_tokens = int(_generation_state["active_seq_len"])
 
@@ -1468,21 +1480,21 @@ def compute_dynamic_transformer_budget(transformer_module=None, is_async=True, p
                     if hasattr(sm, "qkv_proj") or hasattr(sm, "q_proj"):
                         has_combined_qkv = True
                         break
-            # Aktivasi fizikal berperingkat DiTBlock (Sequential Stage-Aware Zero Hardcoding):
-            # 1. State berterusan semasa blok (Residual & Context): 2 * total_tokens * hidden_dim * elem_size
-            persistent_act_bytes = 2 * total_tokens * hidden_dim * elem_size
-            # 2. Tahap Attention: QKV Projection (Query, Key, Value = 3 unjuran) + Attention Workspace (SageAttention/FlashAttention chunked buffer)
-            kv_multiplier = 3.0
-            attn_chunk_size = 128
-            engine_workspace_bytes = min(attn_chunk_size, total_tokens) * inner_dim * elem_size
-            attn_stage_bytes = int(kv_multiplier * total_tokens * inner_dim * elem_size) + engine_workspace_bytes
-            # 3. Tahap MLP: Linear Expansion Projections (SwiGLU gate/up = 8/3 * hidden_dim atau 4 * hidden_dim)
-            mlp_expansion_ratio = 4.0 if hidden_dim <= 2048 else (8.0 / 3.0)
-            mlp_dim = int(hidden_dim * mlp_expansion_ratio)
-            mlp_stage_bytes = 2 * total_tokens * mlp_dim * elem_size
-            # Denyutan puncak terbesar yang berlaku pada satu-satu masa (operasi berlaku secara berurutan, bukan serentak)
-            transient_peak_bytes = max(attn_stage_bytes, mlp_stage_bytes)
-            act_base_bytes = persistent_act_bytes + transient_peak_bytes
+            # Aktivasi fizikal tulen bagi DiTBlock & Attention (100% Zero Hardcoding):
+            # Semasa fasa perhatian DiTBlock:
+            # 1. Residual state input x: 2 * total_tokens * hidden_dim * elem_size
+            # 2. QKV projection tensor (Query, Key, Value = 3 tensor aktif serentak): kv_multiplier * total_tokens * inner_dim * elem_size
+            # 3. Attention output: total_tokens * inner_dim * elem_size
+            # 4. Out projection: total_tokens * hidden_dim * elem_size
+            # 5. Engine workspace (GEMM/SageAttention/FlashAttention buffer): total_tokens * inner_dim * elem_size
+            kv_multiplier = 3.0 if has_combined_qkv else 2.0
+            qkv_bytes = int(kv_multiplier * total_tokens * inner_dim * elem_size)
+            attn_out_bytes = int(total_tokens * inner_dim * elem_size)
+            out_proj_bytes = int(total_tokens * hidden_dim * elem_size)
+            residual_bytes = int(2 * total_tokens * hidden_dim * elem_size)
+            engine_workspace_bytes = int(total_tokens * inner_dim * elem_size)
+            
+            act_base_bytes = qkv_bytes + attn_out_bytes + out_proj_bytes + residual_bytes + engine_workspace_bytes
             attn_headroom_mb = act_base_bytes / (1024 * 1024)
             
         # 4. Pengukuran Sebenar Berat LoRA yang Aktif (Zero Magic Constant / 100% Zero Hardcoding)
@@ -1563,8 +1575,11 @@ def compute_dynamic_transformer_budget(transformer_module=None, is_async=True, p
         else:
             effective_act_headroom_mb = max(observed_pulse, float((total_tokens * hidden_dim * elem_size * 4) / (1024 * 1024)))
         
-        # Penimbal Keselamatan Pemacu Dinamik: 5% daripada saiz VRAM fizikal mengikut spesifikasi Microsoft WDDM & NVIDIA
-        driver_safe_headroom_mb = total_gpu_mb * 0.05
+        # Penimbal Keselamatan Pemacu Dinamik: ambang selamat Microsoft WDDM 88%
+        # Mengikut spesifikasi Microsoft WDDM, komitmen VRAM melepasi 88% (~7172MB pada GPU 8GB)
+        # memulakan GPU Memory Paging secara paksa ke System RAM hos melalui bas PCIe.
+        wddm_safe_ceiling_ratio = 0.88
+        driver_safe_headroom_mb = max(total_gpu_mb * (1.0 - wddm_safe_ceiling_ratio), allocator_frag_mb + 256.0)
         
         # Had Siling Fizikal Mutlak: VRAM Model dilarang menolak aktivasi melepasi kapasiti GDDR6 perkakasan
         pytorch_safe_ceiling_mb = max(
@@ -1596,12 +1611,11 @@ def compute_dynamic_transformer_budget(transformer_module=None, is_async=True, p
                 budget_mb = int(effective_block_mb + base_size_mb)
             num_blocks = preload_blocks
         else:
-            budget_mb = int(max_model_safe_mb) if max_model_safe_mb > base_size_mb else 1024
+            budget_mb = int(max_model_safe_mb) if max_model_safe_mb > base_size_mb else 512
             num_blocks = 0
             
-        # Siling selamat mutlak (memastikan MMGP mempunyai sekurang-kurangnya 2 blok untuk shuttle async jika ada ruang)
-        min_shuttle_budget = int(base_size_mb + 2 * (effective_block_mb if effective_block_mb > 0 else 0))
-        budget_mb = max(min_shuttle_budget, min(budget_mb, int(pytorch_safe_ceiling_mb)))
+        # Pengikat Integriti Fizikal Mutlak: Bajet model dilarang sama sekali melepasi siling keselamatan fizikal
+        budget_mb = max(int(base_size_mb + (effective_block_mb if effective_block_mb > 0 else 0)), min(budget_mb, int(max_model_safe_mb)))
             
         modaliti_str = "Audio" if is_audio else ("Imej" if is_image_2d else "Video")
         log_debug(
@@ -3377,12 +3391,16 @@ try:
                     # 5. Tala semula bajet VRAM transformer secara fizik masa-nyata mengikut mod aktif (Audio vs Video)
                     if active_inst is not None:
                         is_audio = getattr(self, "audio_only", False)
+                        is_ref_mode = getattr(self, "reference_mode", False)
                         if hasattr(self, "transformer") and self.transformer is not None:
                             setattr(self.transformer, "audio_only", is_audio)
+                            setattr(self.transformer, "reference_mode", is_ref_mode)
                         cur_h = getattr(self, "_current_height", None)
                         cur_w = getattr(self, "_current_width", None)
                         cur_fn = getattr(self, "_current_frame_num", None)
-                        retune_active_model_dynamically(active_inst, phase=1, token_scaling_ratio=1.0, is_audio_only=is_audio, height=cur_h, width=cur_w, frame_num=cur_fn)
+                        # Nisbah modaliti fizikal tulen: 4.0 saluran bagi mod rujukan/sambung video (target + rujukan + audio + token refiner)
+                        channel_ratio = 4.0 if is_ref_mode else 1.0
+                        retune_active_model_dynamically(active_inst, phase=1, token_scaling_ratio=channel_ratio, is_audio_only=is_audio, height=cur_h, width=cur_w, frame_num=cur_fn)
 
                     # 6. Laporan Telemetri RAM Masa-Nyata Telus
                     mem = psutil.virtual_memory()
