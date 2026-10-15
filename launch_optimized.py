@@ -312,6 +312,95 @@ def evict_h3_auxiliary_modules(container):
         log_debug(f"[ON-DEMAND DISK-TO-RAM] Ralat menyingkirkan modul pembantu: {ex}")
     return evicted_total
 
+def _vacuum_vmm_orphan_allocations():
+    """Pembersihan Fizikal Blok Yatim MMGP VMM Allocator (Zero VRAM Leak, Sifar Hardcode).
+    Memeriksa ordinary pools dalam C++ vmm_alloc DLL/SO secara dinamik dan membebaskan
+    sebarang alokasi yatim yang tidak lagi dipegang oleh objek Python aktif."""
+    try:
+        from mmgp import allocator
+        if getattr(allocator, "active", None) != "vmm":
+            return 0
+        import sys, ctypes
+        if sys.platform != "win32":
+            return 0
+        kernel32 = ctypes.windll.kernel32
+        h_mod = kernel32.GetModuleHandleW("vmm_alloc_win_amd64.dll")
+        if not h_mod:
+            return 0
+        p_vmm_free = kernel32.GetProcAddress(h_mod, b"vmm_free")
+        p_rel_pool = kernel32.GetProcAddress(h_mod, b"vmm_release_pool")
+        if not p_vmm_free or not p_rel_pool:
+            return 0
+        
+        code_rel = (ctypes.c_uint8 * 64).from_address(p_rel_pool)
+        device_state_fn = None
+        for i in range(len(code_rel) - 5):
+            if code_rel[i] == 0xe8:
+                disp = ctypes.c_int32.from_address(p_rel_pool + i + 1).value
+                target = p_rel_pool + i + 5 + disp
+                device_state_fn = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_int)(target)
+                break
+        if device_state_fn is None:
+            return 0
+        
+        vmm_free_fn = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_void_p)(p_vmm_free)
+        
+        freed_total = 0
+        num_devices = torch.cuda.device_count() if torch.cuda.is_available() else 1
+        for dev_idx in range(num_devices):
+            d_ptr = device_state_fn(dev_idx)
+            if not d_ptr:
+                continue
+            myhead = ctypes.c_uint64.from_address(d_ptr + 0x188).value
+            mysize = ctypes.c_uint64.from_address(d_ptr + 0x190).value
+            if not myhead or mysize == 0:
+                continue
+            
+            pool_nodes = []
+            def _collect_pools(node):
+                if not node or node == myhead or ctypes.c_uint8.from_address(node + 0x19).value:
+                    return
+                _collect_pools(ctypes.c_uint64.from_address(node + 0x00).value)
+                ordinary = ctypes.c_uint8.from_address(node + 0x30).value
+                if ordinary:
+                    pool_nodes.append(node + 0x30)
+                _collect_pools(ctypes.c_uint64.from_address(node + 0x10).value)
+            
+            _collect_pools(ctypes.c_uint64.from_address(myhead + 0x08).value)
+            
+            for p_addr in pool_nodes:
+                live = ctypes.c_uint64.from_address(p_addr + 0x08).value
+                if live == 0:
+                    continue
+                blocks_head = ctypes.c_uint64.from_address(p_addr + 0x178).value
+                blocks_size = ctypes.c_uint64.from_address(p_addr + 0x180).value
+                if not blocks_head or blocks_size == 0:
+                    continue
+                
+                orphans = []
+                def _collect_orphans(b_node):
+                    if not b_node or b_node == blocks_head or ctypes.c_uint8.from_address(b_node + 0x19).value:
+                        return
+                    _collect_orphans(ctypes.c_uint64.from_address(b_node + 0x00).value)
+                    dptr = ctypes.c_uint64.from_address(b_node + 0x20).value
+                    size = ctypes.c_uint64.from_address(b_node + 0x28).value
+                    free_flag = ctypes.c_uint8.from_address(b_node + 0x39).value
+                    if free_flag == 0 and dptr != 0 and size > 0:
+                        orphans.append((dptr, size))
+                    _collect_orphans(ctypes.c_uint64.from_address(b_node + 0x10).value)
+                
+                _collect_orphans(ctypes.c_uint64.from_address(blocks_head + 0x08).value)
+                
+                for dptr, size in orphans:
+                    try:
+                        vmm_free_fn(dptr, size, dev_idx, None)
+                        freed_total += 1
+                    except Exception:
+                        pass
+        return freed_total
+    except Exception:
+        return 0
+
 def flush_vram():
     """Fungsi pembersihan VRAM berfasa automatik kalis ralat sticky CUDA driver."""
     gc.collect()
@@ -326,6 +415,11 @@ def flush_vram():
             pass
         try:
             torch.cuda.synchronize()
+        except Exception:
+            pass
+        try:
+            _vacuum_vmm_orphan_allocations()
+            torch.cuda.empty_cache()
         except Exception:
             pass
 
@@ -3807,6 +3901,7 @@ try:
                         gc.collect()
                         force_pagefile_push(force_trim=True)
                         evict_h3_auxiliary_modules(self)
+                        flush_vram()
                         trim_current_process_working_set()
                         if torch.cuda.is_available():
                             free_post, total_post = torch.cuda.mem_get_info()
@@ -4875,6 +4970,11 @@ def main():
                     pass
                 try:
                     torch.cuda.synchronize()
+                except Exception:
+                    pass
+                try:
+                    _vacuum_vmm_orphan_allocations()
+                    torch.cuda.empty_cache()
                 except Exception:
                     pass
                 try:
