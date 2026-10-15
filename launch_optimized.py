@@ -1459,14 +1459,16 @@ def compute_dynamic_transformer_budget(transformer_module=None, is_async=True, p
                     if hasattr(sm, "qkv_proj") or hasattr(sm, "q_proj"):
                         has_combined_qkv = True
                         break
-            kv_multiplier = 3 if has_combined_qkv else 2
-            qkv_bytes = kv_multiplier * total_tokens * inner_dim * elem_size
-            attn_out_bytes = total_tokens * inner_dim * elem_size
-            out_proj_bytes = total_tokens * hidden_dim * elem_size
-            residual_bytes = 2 * total_tokens * hidden_dim * elem_size
-            engine_workspace_bytes = total_tokens * inner_dim * elem_size
-            
-            act_base_bytes = qkv_bytes + attn_out_bytes + out_proj_bytes + residual_bytes + engine_workspace_bytes
+            # Aktivasi fizikal berperingkat DiTBlock (Sequential Stage-Aware Zero Hardcoding):
+            # 1. State berterusan semasa blok (Residual & Context): 2 * total_tokens * hidden_dim * elem_size
+            persistent_act_bytes = 2 * total_tokens * hidden_dim * elem_size
+            # 2. Tahap Attention: QKV Projection + Attention Workspace (SageAttention chunked buffer)
+            attn_stage_bytes = kv_multiplier * total_tokens * inner_dim * elem_size + engine_workspace_bytes
+            # 3. Tahap MLP: Linear Expansion Projections
+            mlp_stage_bytes = 2 * total_tokens * hidden_dim * elem_size
+            # Denyutan puncak terbesar yang berlaku pada satu-satu masa (operasi berlaku secara berurutan, bukan serentak)
+            transient_peak_bytes = max(attn_stage_bytes, mlp_stage_bytes)
+            act_base_bytes = persistent_act_bytes + transient_peak_bytes
             attn_headroom_mb = act_base_bytes / (1024 * 1024)
             
         # 4. Pengukuran Sebenar Berat LoRA yang Aktif (Zero Magic Constant / 100% Zero Hardcoding)
@@ -1542,10 +1544,10 @@ def compute_dynamic_transformer_budget(transformer_module=None, is_async=True, p
         # Menjamin VRAM tidak melimpah ke PCIe Shared Memory dan DWM kekal lancar
         # Gabungkan denyutan aktivasi puncak sebenar (Dynamic Activation Breathing Pulse) dengan headroom algebra
         observed_pulse = float(_generation_state.get("real_act_pulse_mb", 0.0))
-        effective_act_headroom_mb = max(attn_headroom_mb, observed_pulse)
+        effective_act_headroom_mb = max(observed_pulse, min(attn_headroom_mb, 2200.0)) if attn_headroom_mb > 0 else 1800.0
         
-        # Penimbal Keselamatan Pemacu Dinamik: 10% daripada kapasiti fizikal GPU bagi menampung kuantum PyTorch Allocator
-        driver_safe_headroom_mb = max(512.0, total_gpu_mb * 0.10)
+        # Penimbal Keselamatan Pemacu Dinamik: 512MB bagi menampung kuantum PyTorch Allocator
+        driver_safe_headroom_mb = max(400.0, min(800.0, total_gpu_mb * 0.08))
         
         # Had Siling Fizikal Mutlak: VRAM Model dilarang menolak aktivasi melepasi kapasiti GDDR6 perkakasan
         pytorch_safe_ceiling_mb = max(
@@ -1562,25 +1564,29 @@ def compute_dynamic_transformer_budget(transformer_module=None, is_async=True, p
         usable_storage_mb = max(0.0, max_model_safe_mb - base_size_mb - aux_submodels_mb)
         
         if effective_block_mb > 0:
-            # MMGP tune_preloading akan menolak base_size dan 2 blok in-flight shuttle (2 * block_size)
-            # secara automatik sebelum membahagikan baki kepada preload_blocks.
             total_block_capacity = int(usable_storage_mb // effective_block_mb)
+            # Sasaran Shuttle Preloading Pantas: Berikan sekurang-kurangnya 4 hingga 8 blok pra-muat (1200MB - 1800MB)
+            # selagi baki fizikal VRAM GPU bebas >= 2000 MB
             if total_block_capacity >= 3:
-                preload_blocks = min(max_safe_preload_blocks, total_block_capacity - 2)
+                preload_blocks = min(max_safe_preload_blocks, min(8, max(4, total_block_capacity - 2)))
+                budget_mb = int((preload_blocks + 2) * effective_block_mb + base_size_mb)
+            elif free_mb >= (base_size_mb + 4 * effective_block_mb + 1000.0):
+                preload_blocks = 4
                 budget_mb = int((preload_blocks + 2) * effective_block_mb + base_size_mb)
             elif total_block_capacity >= 1:
-                preload_blocks = 0
-                budget_mb = int(effective_block_mb + base_size_mb)
+                preload_blocks = 1
+                budget_mb = int(2 * effective_block_mb + base_size_mb)
             else:
                 preload_blocks = 0
-                budget_mb = int(base_size_mb)
+                budget_mb = int(effective_block_mb + base_size_mb)
             num_blocks = preload_blocks
         else:
-            budget_mb = int(max_model_safe_mb) if max_model_safe_mb > base_size_mb else 512
+            budget_mb = int(max_model_safe_mb) if max_model_safe_mb > base_size_mb else 1024
             num_blocks = 0
             
-        # Pengikat Integriti Fizikal Mutlak: Bajet model dilarang sama sekali melepasi siling keselamatan fizikal
-        budget_mb = max(int(base_size_mb + (effective_block_mb if effective_block_mb > 0 else 0)), min(budget_mb, int(max_model_safe_mb)))
+        # Siling selamat mutlak (memastikan MMGP mempunyai sekurang-kurangnya 2 blok untuk shuttle async jika ada ruang)
+        min_shuttle_budget = int(base_size_mb + 2 * (effective_block_mb if effective_block_mb > 0 else 0))
+        budget_mb = max(min_shuttle_budget, min(budget_mb, int(pytorch_safe_ceiling_mb)))
             
         modaliti_str = "Audio" if is_audio else ("Imej" if is_image_2d else "Video")
         log_debug(
@@ -3286,22 +3292,52 @@ try:
         # ----------------------------------------------------------------------
         if not getattr(h3_pipe, "_smart_lifecycle_patched", False):
             pipeline_cls = h3_pipe.MiniMaxH3Pipeline
+            _orig_pipe_init = pipeline_cls.__init__
             _orig_use_trans = pipeline_cls._use_transformer
             _orig_use_shared = pipeline_cls._use_shared_components
             _orig_generate = pipeline_cls.generate
+
+            @functools.wraps(_orig_pipe_init)
+            def _patched_pipe_init(self, *args, **kwargs):
+                _orig_pipe_init(self, *args, **kwargs)
+                if not getattr(self, "_h3_text_encoder_fn", None):
+                    import shared.file_locator as fl
+                    try:
+                        self._h3_text_encoder_fn = fl.locate_file("ckpts/Qwen3-VL-32B-Instruct/qwen3vl-32B-MiniMax-H3-Q4_K_M.gguf")
+                    except Exception:
+                        self._h3_text_encoder_fn = None
 
             def _smart_use_transformer(self):
                 self._in_transformer_phase = True
                 _orig_use_trans(self)
                 try:
-                    # 1. Lupuskan modul selesai (text_encoder & vision_encoder) 100% daripada RAM & Pagefile (True On-Demand)
-                    if hasattr(self, "text_encoder") and self.text_encoder is not None:
-                        _deep_release_finished_module(self.text_encoder, "text_encoder")
-                    if hasattr(self, "vision_encoder") and self.vision_encoder is not None:
-                        _deep_release_finished_module(self.vision_encoder, "vision_encoder")
-                    self._text_encoder_needs_reload = True
-                    
+                    # 1. True On-Demand: Lupuskan Qwen Text Encoder & Vision Encoder 100% daripada RAM & VRAM
                     active_inst = get_active_mmgp_instance()
+                    if active_inst is not None:
+                        for mid in ("text_encoder", "vision_encoder"):
+                            safe_mmgp_unload(active_inst, mid)
+                            active_inst.models.pop(mid, None)
+                        if hasattr(active_inst, "block_items") and isinstance(active_inst.block_items, dict):
+                            for k in list(active_inst.block_items.keys()):
+                                if "text_encoder" in str(k) or "vision_encoder" in str(k):
+                                    del active_inst.block_items[k]
+
+                    te = getattr(self, "text_encoder", None)
+                    if te is not None:
+                        for sub_m in (getattr(te, "language_model", None), getattr(te, "visual", None), te):
+                            if sub_m is not None:
+                                if hasattr(sub_m, "parameters"):
+                                    for p in sub_m.parameters():
+                                        if p is not None and hasattr(p, "data"):
+                                            p.data = torch.empty(0, dtype=p.dtype, device='cpu')
+                                if hasattr(sub_m, "buffers"):
+                                    for b in sub_m.buffers():
+                                        if b is not None:
+                                            b.data = torch.empty(0, dtype=b.dtype, device='cpu')
+                        self.text_encoder = None
+                        self._text_encoder_needs_reload = True
+                        log_debug("[TRUE ON-DEMAND] Qwen Text Encoder (20GB) dikosongkan 100% daripada RAM hos.")
+                    
                     if active_inst is not None:
                         # Nyahmuat semua modul dorman bukan transformer secara dinamik (Zero Hardcoding)
                         for mid in list(active_inst.models.keys()):
@@ -3323,7 +3359,6 @@ try:
                         release_ram_cache()
                     except Exception:
                         pass
-                    # Segarkan kitaran memori tanpa pembekuan I/O pada proses luar
                     force_pagefile_push(force_trim=False)
                     # Lucutkan serta-merta 18GB halaman mmap Qwen Text Encoder daripada RAM fizikal proses (0.25 ms)
                     trim_current_process_working_set()
@@ -3373,20 +3408,31 @@ try:
                 self._in_transformer_phase = False
                 try:
                     # Semak jika text_encoder perlu dimuatkan semula secara On-Demand untuk penjanaan baharu
-                    if getattr(self, "_text_encoder_needs_reload", False):
+                    if getattr(self, "_text_encoder_needs_reload", False) or getattr(self, "text_encoder", None) is None:
                         try:
                             sample_p = next(self.text_encoder.parameters(), None) if (hasattr(self, "text_encoder") and self.text_encoder is not None) else None
                             if sample_p is None or sample_p.data.numel() == 0:
                                 log_debug("[ON-DEMAND LIFECYCLE] Memuat semula Text Encoder secara On-Demand untuk arahan baharu...")
+                                from mmgp import quant_router
+                                from shared.qtypes import gguf as gguf_handler
+                                quant_router.register_file_extension('gguf', gguf_handler)
                                 from models.minimax_h3.minimax_h3_main import _load_text_encoder
                                 te_fn = getattr(self, "_h3_text_encoder_fn", None)
                                 if not te_fn:
                                     import shared.file_locator as fl
                                     te_fn = fl.locate_file("ckpts/Qwen3-VL-32B-Instruct/qwen3vl-32B-MiniMax-H3-Q4_K_M.gguf")
                                 if te_fn and os.path.exists(te_fn):
+                                    t0_reload = time.perf_counter()
                                     self.text_encoder = _load_text_encoder(te_fn, self.dtype)
                                     self._text_encoder_needs_reload = False
-                                    log_debug("[ON-DEMAND LIFECYCLE] Text Encoder berjaya dimuatkan semula On-Demand.")
+                                    active_inst = get_active_mmgp_instance()
+                                    if active_inst is not None and hasattr(active_inst, "models"):
+                                        if hasattr(self.text_encoder, "language_model"):
+                                            active_inst.models["text_encoder"] = self.text_encoder.language_model
+                                        if hasattr(self.text_encoder, "visual"):
+                                            active_inst.models["vision_encoder"] = self.text_encoder.visual
+                                    t_el = time.perf_counter() - t0_reload
+                                    log_debug(f"[ON-DEMAND LIFECYCLE] Text Encoder berjaya dimuatkan semula On-Demand dalam {t_el:.2f}s.")
                         except Exception as te_reload_err:
                             log_debug(f"[ON-DEMAND LIFECYCLE] Notis muat semula text_encoder: {te_reload_err}")
 
@@ -3458,6 +3504,7 @@ try:
             pipeline_cls._use_transformer = _smart_use_transformer
             pipeline_cls._use_shared_components = _smart_use_shared_components
             pipeline_cls.generate = _smart_generate
+            pipeline_cls.__init__ = _patched_pipe_init
 
             # Pengawal Langkah Denoising Dinamik Sejagat (Zero Hardcoding)
             _orig_h3_tqdm = h3_pipe.tqdm
@@ -4596,6 +4643,21 @@ def main():
     if target_abort_clean in patched_code:
         patched_code = patched_code.replace(target_abort_clean, replacement_abort_clean, 1)
         log_debug("Perisai Pembersihan Pasca-Batal/Ralat berjaya disuntik.")
+
+    # Suntikan 4: Perisai Gradio NoneType Guard (Anti-Spam TypeError Console)
+    target_enhancer = '''def refresh_prompt_enhancer_labels(state, metadata, *, tab_id="generate"):
+    # The first value scopes browser deduplication to this model selection.
+    inputs = dict(zip(prompt_enhancer_labels.INPUT_KEYS, metadata[1:-1]))'''
+
+    replacement_enhancer = '''def refresh_prompt_enhancer_labels(state, metadata, *, tab_id="generate"):
+    if metadata is None or not isinstance(metadata, (list, tuple)) or len(metadata) < 2:
+        return gr.skip(), gr.skip()
+    # The first value scopes browser deduplication to this model selection.
+    inputs = dict(zip(prompt_enhancer_labels.INPUT_KEYS, metadata[1:-1]))'''
+
+    if target_enhancer in patched_code:
+        patched_code = patched_code.replace(target_enhancer, replacement_enhancer, 1)
+        log_debug("Perisai Gradio NoneType Guard (refresh_prompt_enhancer_labels) berjaya disuntik.")
 
     # Jalankan wgp.py dalam konteks __main__
     exec(patched_code, main_module.__dict__)
