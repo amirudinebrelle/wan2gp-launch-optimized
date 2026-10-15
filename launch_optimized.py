@@ -1462,10 +1462,15 @@ def compute_dynamic_transformer_budget(transformer_module=None, is_async=True, p
             # Aktivasi fizikal berperingkat DiTBlock (Sequential Stage-Aware Zero Hardcoding):
             # 1. State berterusan semasa blok (Residual & Context): 2 * total_tokens * hidden_dim * elem_size
             persistent_act_bytes = 2 * total_tokens * hidden_dim * elem_size
-            # 2. Tahap Attention: QKV Projection + Attention Workspace (SageAttention chunked buffer)
-            attn_stage_bytes = kv_multiplier * total_tokens * inner_dim * elem_size + engine_workspace_bytes
-            # 3. Tahap MLP: Linear Expansion Projections
-            mlp_stage_bytes = 2 * total_tokens * hidden_dim * elem_size
+            # 2. Tahap Attention: QKV Projection (Query, Key, Value = 3 unjuran) + Attention Workspace (SageAttention/FlashAttention chunked buffer)
+            kv_multiplier = 3.0
+            attn_chunk_size = 128
+            engine_workspace_bytes = min(attn_chunk_size, total_tokens) * inner_dim * elem_size
+            attn_stage_bytes = int(kv_multiplier * total_tokens * inner_dim * elem_size) + engine_workspace_bytes
+            # 3. Tahap MLP: Linear Expansion Projections (SwiGLU gate/up = 8/3 * hidden_dim atau 4 * hidden_dim)
+            mlp_expansion_ratio = 4.0 if hidden_dim <= 2048 else (8.0 / 3.0)
+            mlp_dim = int(hidden_dim * mlp_expansion_ratio)
+            mlp_stage_bytes = 2 * total_tokens * mlp_dim * elem_size
             # Denyutan puncak terbesar yang berlaku pada satu-satu masa (operasi berlaku secara berurutan, bukan serentak)
             transient_peak_bytes = max(attn_stage_bytes, mlp_stage_bytes)
             act_base_bytes = persistent_act_bytes + transient_peak_bytes
@@ -1544,10 +1549,13 @@ def compute_dynamic_transformer_budget(transformer_module=None, is_async=True, p
         # Menjamin VRAM tidak melimpah ke PCIe Shared Memory dan DWM kekal lancar
         # Gabungkan denyutan aktivasi puncak sebenar (Dynamic Activation Breathing Pulse) dengan headroom algebra
         observed_pulse = float(_generation_state.get("real_act_pulse_mb", 0.0))
-        effective_act_headroom_mb = max(observed_pulse, min(attn_headroom_mb, 2200.0)) if attn_headroom_mb > 0 else 1800.0
+        if attn_headroom_mb > 0:
+            effective_act_headroom_mb = max(observed_pulse, attn_headroom_mb)
+        else:
+            effective_act_headroom_mb = max(observed_pulse, float((total_tokens * hidden_dim * elem_size * 4) / (1024 * 1024)))
         
-        # Penimbal Keselamatan Pemacu Dinamik: 512MB bagi menampung kuantum PyTorch Allocator
-        driver_safe_headroom_mb = max(400.0, min(800.0, total_gpu_mb * 0.08))
+        # Penimbal Keselamatan Pemacu Dinamik: 5% daripada saiz VRAM fizikal mengikut spesifikasi Microsoft WDDM & NVIDIA
+        driver_safe_headroom_mb = total_gpu_mb * 0.05
         
         # Had Siling Fizikal Mutlak: VRAM Model dilarang menolak aktivasi melepasi kapasiti GDDR6 perkakasan
         pytorch_safe_ceiling_mb = max(
@@ -1565,15 +1573,13 @@ def compute_dynamic_transformer_budget(transformer_module=None, is_async=True, p
         
         if effective_block_mb > 0:
             total_block_capacity = int(usable_storage_mb // effective_block_mb)
-            # Sasaran Shuttle Preloading Pantas: Berikan sekurang-kurangnya 4 hingga 8 blok pra-muat (1200MB - 1800MB)
-            # selagi baki fizikal VRAM GPU bebas >= 2000 MB
-            if total_block_capacity >= 3:
-                preload_blocks = min(max_safe_preload_blocks, min(8, max(4, total_block_capacity - 2)))
+            # Kapasiti pra-muat berasaskan fizik MMGP Async Circular Shuttle:
+            # 2 penimbal kerja diperlukan (1 blok aktif dieksekusi, 1 blok dipra-muat melalui PCIe stream).
+            # Baki blok disimpan dalam VRAM sebagai resident cache untuk memaksimumkan kelajuan denoising.
+            if total_block_capacity >= 2:
+                preload_blocks = min(max_safe_preload_blocks, total_block_capacity - 2)
                 budget_mb = int((preload_blocks + 2) * effective_block_mb + base_size_mb)
-            elif free_mb >= (base_size_mb + 4 * effective_block_mb + 1000.0):
-                preload_blocks = 4
-                budget_mb = int((preload_blocks + 2) * effective_block_mb + base_size_mb)
-            elif total_block_capacity >= 1:
+            elif total_block_capacity == 1:
                 preload_blocks = 1
                 budget_mb = int(2 * effective_block_mb + base_size_mb)
             else:
@@ -2317,8 +2323,9 @@ try:
                 if _generation_state["stage1_done"] or _generation_state["phase"] == 2:
                     if _generation_state["transformer_seen"] < 2:
                         _generation_state["transformer_seen"] = 2
-                        log_debug("[MMGP STATE MACHINE] Fasa 2 Dikesan: Menala MMGP ke Mod Aliran Bersiri HD...")
-                        retune_active_model_dynamically(self, phase=2, token_scaling_ratio=4.0)
+                        dyn_scale = float(_generation_state.get("token_scaling_ratio", 1.0))
+                        log_debug(f"[MMGP STATE MACHINE] Fasa 2 Dikesan: Menala MMGP ke Mod Aliran Bersiri (Nisbah Skala={dyn_scale})...")
+                        retune_active_model_dynamically(self, phase=2, token_scaling_ratio=dyn_scale)
             elif model_id in ('vae', 'video_decoder', 'audio_decoder', 'vocoder', 'audio_vae'):
                 log_debug("[MMGP STATE MACHINE] Fasa VAE / Audio Dikesan: Mengosongkan transformer 100% dari VRAM...")
                 self.unload_all()
@@ -2946,7 +2953,8 @@ try:
             if active_inst is not None:
                 for dead_m in ('spatial_upsampler', 'video_encoder', 'text_encoder', 'text_embedding_projection'):
                     safe_mmgp_unload(active_inst, dead_m)
-                retune_active_model_dynamically(active_inst, phase=2, token_scaling_ratio=4.0)
+                dyn_scale = float(_generation_state.get("token_scaling_ratio", 1.0))
+                retune_active_model_dynamically(active_inst, phase=2, token_scaling_ratio=dyn_scale)
             flush_vram()
             force_pagefile_push()
         else:
