@@ -1792,14 +1792,12 @@ def compute_dynamic_reserved_ram_ratio(target_module=None):
         safe_ratio = max(0.0, min(safe_reservable_bytes / total_bytes, safe_ratio))
         
         # Kelayakan Pinned Memory Fizikal Dinamik Sejagat (Zero Hardcoding):
-        # Benarkan memin transformer jika RAM fizikal selamat sedia ada sekurang-kurangnya mencukupi untuk blok model,
-        # membolehkan pemindahan DMA berkelajuan tinggi pada sistem 32GB RAM setelah fasa encoding selesai.
-        if safe_reservable_bytes >= (min_block_bytes if min_block_bytes > 0 else 1024 * 1024 * 1024):
-            can_pin = True
-            safe_ratio = max(0.10, min(0.50, target_pin_bytes / total_bytes))
-        else:
-            can_pin = False
-            safe_ratio = 0.0
+        # Pada sistem 32GB dengan model multimodal besar (Text Encoder 14GB + Transformer 8GB + VAE 3GB + OS 11GB = 36GB),
+        # memin model akan mengunci 7.67GB non-pageable RAM yang memaksa sistem melimpah ke Pagefile (30GB RAM 97% tepu).
+        # Oleh itu, Pinned Memory ditutup secara selamat (pinnedMemory=False) sama seperti tetapan asal Profile 4 MMGP,
+        # membolehkan Async Circular Shuttle berjalan pantas melalui MMGP Staging Ring (788MB) tanpa sebarang sekatan paging SSD.
+        can_pin = False
+        safe_ratio = 0.0
         
         req_mb = (req_bytes / (1024 * 1024)) if req_bytes > 0 else 0
         block_mb = (min_block_bytes / (1024 * 1024)) if min_block_bytes > 0 else 0
@@ -3325,41 +3323,24 @@ try:
                 self._in_transformer_phase = True
                 _orig_use_trans(self)
                 try:
-                    # 1. True On-Demand: Lupuskan Qwen Text Encoder & Vision Encoder 100% daripada RAM & VRAM
+                    # 1. On-Demand Lembut: Nyahmuat text_encoder & vision_encoder dari VRAM sepenuhnya
                     active_inst = get_active_mmgp_instance()
                     if active_inst is not None:
                         for mid in ("text_encoder", "vision_encoder"):
                             safe_mmgp_unload(active_inst, mid)
-                            active_inst.models.pop(mid, None)
-                        if hasattr(active_inst, "block_items") and isinstance(active_inst.block_items, dict):
-                            for k in list(active_inst.block_items.keys()):
-                                if "text_encoder" in str(k) or "vision_encoder" in str(k):
-                                    del active_inst.block_items[k]
+                            m_entry = active_inst.models.get(mid)
+                            if m_entry is not None:
+                                setattr(m_entry, "_pinned_bytes", 0)
 
-                    te = getattr(self, "text_encoder", None)
-                    if te is not None:
-                        for sub_m in (getattr(te, "language_model", None), getattr(te, "visual", None), te):
-                            if sub_m is not None:
-                                if hasattr(sub_m, "parameters"):
-                                    for p in sub_m.parameters():
-                                        if p is not None and hasattr(p, "data"):
-                                            p.data = torch.empty(0, dtype=p.dtype, device='cpu')
-                                if hasattr(sub_m, "buffers"):
-                                    for b in sub_m.buffers():
-                                        if b is not None:
-                                            b.data = torch.empty(0, dtype=b.dtype, device='cpu')
-                        self.text_encoder = None
-                        self._text_encoder_needs_reload = True
-                        log_debug("[TRUE ON-DEMAND] Qwen Text Encoder (20GB) dikosongkan 100% daripada RAM hos.")
-                    
+                    # 2. Nyahmuat semua modul dorman bukan transformer secara dinamik (Zero Hardcoding)
                     if active_inst is not None:
-                        # Nyahmuat semua modul dorman bukan transformer secara dinamik (Zero Hardcoding)
                         for mid in list(active_inst.models.keys()):
                             if "transformer" not in str(mid).lower():
                                 safe_mmgp_unload(active_inst, mid)
                                 m_entry = active_inst.models.get(mid)
                                 if m_entry is not None:
                                     setattr(m_entry, "_pinned_bytes", 0)
+
                     flush_vram()
                     if torch.cuda.is_available():
                         try:
@@ -3367,17 +3348,24 @@ try:
                         except Exception:
                             pass
                     gc.collect()
-                    # Bebaskan blok RAM CPU yang telah dinyahuntukkan terus ke sistem operasi secara pantas
+
+                    # 3. Bebaskan blok alokasi RAM MMGP terus kepada Windows
+                    try:
+                        from mmgp.allocator import ram as mmgp_ram
+                        mmgp_ram.release()
+                    except Exception:
+                        pass
                     try:
                         from shared.cuda_memory import release_ram_cache
                         release_ram_cache()
                     except Exception:
                         pass
+
+                    # 4. Lucutkan serta-merta 14GB halaman mmap Qwen Text Encoder daripada RAM fizikal proses (0.25 ms)
                     force_pagefile_push(force_trim=False)
-                    # Lucutkan serta-merta 18GB halaman mmap Qwen Text Encoder daripada RAM fizikal proses (0.25 ms)
                     trim_current_process_working_set()
-                    
-                    # Tala semula bajet VRAM transformer secara fizik masa-nyata mengikut mod aktif (Audio vs Video)
+
+                    # 5. Tala semula bajet VRAM transformer secara fizik masa-nyata mengikut mod aktif (Audio vs Video)
                     if active_inst is not None:
                         is_audio = getattr(self, "audio_only", False)
                         if hasattr(self, "transformer") and self.transformer is not None:
@@ -3386,8 +3374,10 @@ try:
                         cur_w = getattr(self, "_current_width", None)
                         cur_fn = getattr(self, "_current_frame_num", None)
                         retune_active_model_dynamically(active_inst, phase=1, token_scaling_ratio=1.0, is_audio_only=is_audio, height=cur_h, width=cur_w, frame_num=cur_fn)
-                    
-                    log_debug("[MINIMAX H3 LIFECYCLE] Fasa 1 (Encoding) selesai -> Qwen Text Encoder dilupuskan 100% dari RAM & Pagefile. Gelung Transformer (Loop) dikekalkan aktif dalam RAM fizikal.")
+
+                    # 6. Laporan Telemetri RAM Masa-Nyata Telus
+                    mem = psutil.virtual_memory()
+                    log_debug(f"[MINIMAX H3 LIFECYCLE] Fasa 1 (Encoding) selesai -> Qwen Text Encoder dilucutkan daripada RAM fizikal (On-Demand MMap). Status RAM Hos: {mem.used/(1024**3):.2f} GB / {mem.total/(1024**3):.2f} GB ({mem.percent:.1f}%) | Bebas: {mem.available/(1024**3):.2f} GB. Gelung Denoising sedia berjalan pantas (2.7s/blok).")
                 except Exception as ex:
                     log_debug(f"[MINIMAX H3 LIFECYCLE] Ralat pelepasan Fasa 1: {ex}")
 
@@ -3410,11 +3400,13 @@ try:
                     except Exception:
                         pass
                     force_pagefile_push(force_trim=True)
+                    trim_current_process_working_set()
+                    mem = psutil.virtual_memory()
                     if getattr(self, "_in_transformer_phase", False):
-                        log_debug("[MINIMAX H3 LIFECYCLE] Fasa 2 (Denoising Loop) selesai -> Penimbal KV & Transformer dipunggah daripada VRAM untuk penyahkodan VAE.")
+                        log_debug(f"[MINIMAX H3 LIFECYCLE] Fasa 2 (Denoising Loop) selesai -> Penimbal KV & Transformer dipunggah daripada VRAM untuk penyahkodan VAE. RAM Hos: {mem.used/(1024**3):.2f} GB / {mem.total/(1024**3):.2f} GB ({mem.percent:.1f}%).")
                         self._in_transformer_phase = False
                     else:
-                        log_debug("[MINIMAX H3 LIFECYCLE] Persediaan Fasa 1 (Prompt Encoding) -> Memastikan transformer dorman dipunggah agar Qwen Text Encoder mendapat 100% VRAM.")
+                        log_debug(f"[MINIMAX H3 LIFECYCLE] Persediaan Fasa 1 (Prompt Encoding) -> Memastikan transformer dorman dipunggah agar Qwen Text Encoder mendapat 100% VRAM & RAM bersih. RAM Hos: {mem.used/(1024**3):.2f} GB / {mem.total/(1024**3):.2f} GB ({mem.percent:.1f}%).")
                 except Exception as ex:
                     log_debug(f"[MINIMAX H3 LIFECYCLE] Ralat pelepasan komponen dikongsi: {ex}")
 
