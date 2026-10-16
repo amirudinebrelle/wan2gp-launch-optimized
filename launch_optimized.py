@@ -2531,6 +2531,24 @@ try:
             return _original_gpu_load(self, model_id, *args, **kwargs)
         mmgp_offload.offload.gpu_load = _patched_gpu_load
 
+    _orig_stager_to_gpu = getattr(mmgp_offload.Stager, "to_gpu", None) if hasattr(mmgp_offload, "Stager") else None
+    if _orig_stager_to_gpu is not None:
+        @functools.wraps(_orig_stager_to_gpu)
+        def _resilient_stager_to_gpu(self, p, *args, **kwargs):
+            try:
+                return _orig_stager_to_gpu(self, p, *args, **kwargs)
+            except (OSError, Exception) as ex:
+                log_debug(f"[PERISAI MMGP STAGER RESCUE] Memintas ralat pemindahan Stager ({ex}). Mengaktifkan pemindahan PyTorch DMA selamat...")
+                try:
+                    return p.to("cuda", non_blocking=True)
+                except Exception:
+                    try:
+                        return p.to("cuda")
+                    except Exception:
+                        return p
+        mmgp_offload.Stager.to_gpu = _resilient_stager_to_gpu
+        log_debug("Perisai Sejagat MMGP Stager Resilient to_gpu (Anti-Access-Violation / Anti-Crash) berjaya dipasang.")
+
     _mmgp_raw_gpu_load_blocks = mmgp_offload.offload.gpu_load_blocks if hasattr(mmgp_offload, "offload") else None
     if _mmgp_raw_gpu_load_blocks is not None:
         @functools.wraps(_mmgp_raw_gpu_load_blocks)
@@ -2546,12 +2564,24 @@ try:
                 return _mmgp_raw_gpu_load_blocks(self, model_id, blocks_name, preload=preload, *args, **kwargs)
             except Exception as e:
                 err_s = str(e).lower()
-                if "out of memory" in err_s or "cuda" in err_s or "acceleratorerror" in err_s:
-                    flush_vram()
-                    if hasattr(self, "next_blocks_names") and entry_name in self.next_blocks_names:
-                        self.next_blocks_names[entry_name] = None
+                log_debug(f"[MMGP GPU_LOAD_BLOCKS RESCUE] Mengesan ralat pemuatan blok {entry_name} ({e}). Memulihkan alokasi...")
+                flush_vram()
+                if hasattr(self, "next_blocks_names") and entry_name in self.next_blocks_names:
+                    self.next_blocks_names[entry_name] = None
+                try:
                     return _mmgp_raw_gpu_load_blocks(self, model_id, blocks_name, preload=preload, *args, **kwargs)
-                raise e
+                except Exception as e2:
+                    log_debug(f"[MMGP GPU_LOAD_BLOCKS RESCUE] Percubaan semula gagal ({e2}). Melaksanakan fallback pemindahan terus model...")
+                    m = self.models.get(model_id) if hasattr(self, "models") else None
+                    if m is not None:
+                        try:
+                            m.to("cuda")
+                            return None
+                        except Exception:
+                            pass
+                    if "out of memory" in err_s or "cuda" in err_s or "acceleratorerror" in err_s or "access violation" in err_s:
+                        return None
+                    raise e2
 
         mmgp_offload.offload.gpu_load_blocks = _unified_gpu_load_blocks
 
@@ -3518,7 +3548,7 @@ try:
                     val = sd[p_name]
                     if val.dtype != p.dtype:
                         val = val.to(dtype=p.dtype)
-                    torch.utils.swap_tensors(p, val)
+                    p.data = val
                     reloaded += 1
             del sd
             t_el = time.perf_counter() - t0
@@ -3627,7 +3657,7 @@ try:
                     val = sd[p_name]
                     if val.dtype != p.dtype:
                         val = val.to(dtype=p.dtype)
-                    torch.utils.swap_tensors(p, val)
+                    p.data = val
                     reloaded += 1
             del sd
             t_el = time.perf_counter() - t0
