@@ -337,12 +337,9 @@ class CentralizedUniversalLifecycleManager:
         )
 
     def purge_module_completely(self, module, module_id=""):
-        """Melupuskan modul 100% dari VRAM dan RAM (Unpin -> Kosongkan Tensor -> Pangkas RAM Windows)."""
+        """Mengosongkan modul daripada VRAM secara selamat tanpa memusnahkan struktur tensor (Memelihara MMGP hooks & mmap)."""
         if module is None:
             return 0
-        purged_params = 0
-
-        # 1. Nyahmuat daripada MMGP (Unpin & Unload)
         try:
             active_inst = get_active_mmgp_instance()
             if active_inst is not None and module_id:
@@ -353,51 +350,6 @@ class CentralizedUniversalLifecycleManager:
         except Exception:
             pass
 
-        # 2. Kosongkan tensor data dan penimbal secara rekursif (termasuk QTensor dan Quanto)
-        try:
-            if isinstance(module, torch.nn.Module):
-                for m in module.modules():
-                    if hasattr(m, "_parameters"):
-                        for p_name in list(m._parameters.keys()):
-                            p = m._parameters.get(p_name)
-                            if p is not None:
-                                if hasattr(p, "_data") and torch.is_tensor(p._data) and p._data.numel() > 0:
-                                    p._data = torch.empty(0, dtype=p._data.dtype, device='cpu')
-                                if hasattr(p, "_scale") and torch.is_tensor(p._scale) and p._scale.numel() > 0:
-                                    p._scale = torch.empty(0, dtype=p._scale.dtype, device='cpu')
-                                if hasattr(p, "data") and torch.is_tensor(p.data) and p.data.numel() > 0:
-                                    p.data = torch.empty(0, dtype=p.dtype, device='cpu')
-                                purged_params += 1
-                    if hasattr(m, "_buffers"):
-                        for b_name in list(m._buffers.keys()):
-                            # Jangan kosongkan buffer struktur penting (zero_k_bias, inv_freq, dll.)
-                            if b_name in ("zero_k_bias", "inv_freq", "freqs_cis", "position_ids", "sin_cached", "cos_cached"):
-                                continue
-                            b = m._buffers.get(b_name)
-                            if b is not None and hasattr(b, "data") and torch.is_tensor(b.data) and b.data.numel() > 250000:
-                                b.data = torch.empty(0, dtype=b.dtype, device='cpu')
-                                purged_params += 1
-        except Exception:
-            pass
-
-        # 3. Bebaskan cache PyTorch, MMGP Allocator, dan GGUF Index
-        try:
-            from mmgp.allocator import ram as mmgp_ram
-            mmgp_ram.release()
-        except Exception:
-            pass
-        try:
-            from shared.cuda_memory import release_ram_cache
-            release_ram_cache()
-        except Exception:
-            pass
-        try:
-            from shared.qtypes import gguf as gguf_handler
-            if hasattr(gguf_handler, "_GGUF_LABEL_CACHE"): gguf_handler._GGUF_LABEL_CACHE.clear()
-            if hasattr(gguf_handler, "_GGUF_METADATA_CACHE"): gguf_handler._GGUF_METADATA_CACHE.clear()
-            if hasattr(gguf_handler, "_GGUF_INDEX_CACHE"): gguf_handler._GGUF_INDEX_CACHE.clear()
-        except Exception:
-            pass
         flush_vram()
         if torch.cuda.is_available():
             try:
@@ -405,41 +357,16 @@ class CentralizedUniversalLifecycleManager:
             except Exception:
                 pass
         gc.collect()
-
-        # 4. Pangkas Working Set Windows (Halaman memori dikembalikan ke sistem serta-merta)
         trim_current_process_working_set()
-
-        self.log_telemetry_snapshot("PELUPUSAN MODUL", f"Modul '{module_id}' (100% Sifar Alokasi Terbukti)")
-        return purged_params
+        self.log_telemetry_snapshot("PELEPASAN VRAM", f"Modul '{module_id}' selamat dilepaskan dari VRAM")
+        return 1
 
     def on_model_loaded(self, pipeline, offloadobj=None):
-        """Zero-RAM Startup: Melupuskan Text Encoder dan VAE daripada RAM sebaik sahaja
-        startup/load_models selesai supaya RAM dorman permulaan tidak melonjak ke 30 GB.
-        Text Encoder dimuatkan semula dalam <0.5s apabila penjanaan bermula."""
-        log_debug("[UNIVERSAL LIFECYCLE] Mengaktifkan Zero-RAM Startup Interceptor (Pembersihan Awal Pasca-Muat)...")
-        if pipeline is not None:
-            te = getattr(pipeline, "text_encoder", None)
-            if te is not None:
-                for sub in (getattr(te, "language_model", None), getattr(te, "visual", None), te):
-                    if sub is not None:
-                        self.purge_module_completely(sub, "text_encoder")
-                pipeline.text_encoder = None
-                setattr(pipeline, "_text_encoder_needs_reload", True)
-
-            vae = getattr(pipeline, "video_decoder", None) or getattr(pipeline, "vae", None)
-            if vae is not None:
-                self.purge_module_completely(vae, "vae")
-
-            a_vae = getattr(pipeline, "audio_vae", None)
-            if a_vae is not None:
-                self.purge_module_completely(a_vae, "audio_vae")
-
-            upscaler = getattr(pipeline, "latent_upscaler", None)
-            if upscaler is not None:
-                self.purge_module_completely(upscaler, "latent_upscaler")
-
+        """Memastikan peruntukan VRAM dorman dibersihkan tanpa memusnahkan modul MMGP."""
+        log_debug("[UNIVERSAL LIFECYCLE] Pasca-Muat: Memelihara integriti modul MMGP & membersihkan VRAM dorman...")
+        flush_vram()
         trim_current_process_working_set()
-        self.log_telemetry_snapshot("STARTUP BERSIH", "RAM permulaan kekal minimum sifar pembaziran.")
+        self.log_telemetry_snapshot("STARTUP BERSIH", "RAM permulaan optimum, modul MMGP terpelihara 100%.")
 
     def transition_to_phase(self, new_phase, pipeline=None, context=None):
         """Pusat Kawalan Peralihan Fasa (Fasa 1: Encode -> Fasa 2: Denoise -> Fasa 3: Decode -> Selesai)."""
@@ -450,38 +377,24 @@ class CentralizedUniversalLifecycleManager:
         log_debug(f"[UNIVERSAL LIFECYCLE] Peralihan Fasa: {old_phase} -> {new_phase}")
 
         if new_phase == "PHASE_2_DENOISING":
-            # Fasa 1 Tamat: Lupus 100% Text Encoder & Vision Encoder daripada VRAM dan RAM
-            if pipeline is not None:
-                te = getattr(pipeline, "text_encoder", None)
-                if te is not None:
-                    for sub in (getattr(te, "language_model", None), getattr(te, "visual", None), te):
-                        if sub is not None:
-                            self.purge_module_completely(sub, "text_encoder")
-                    pipeline.text_encoder = None
-                    setattr(pipeline, "_text_encoder_needs_reload", True)
-                for enc_name in ("vision_encoder", "clip", "video_encoder", "text_encoder"):
-                    enc_mod = getattr(pipeline, enc_name, None)
-                    if enc_mod is not None:
-                        self.purge_module_completely(enc_mod, enc_name)
-                    act = get_active_mmgp_instance()
-                    if act is not None and hasattr(act, "models") and enc_name in act.models:
-                        try:
-                            act.models.pop(enc_name, None)
-                        except Exception:
-                            pass
-            self.log_telemetry_snapshot("FASA 1 TAMAT", "Text Encoder 100% dilupuskan, RAM Lapang untuk Transformer")
+            # Fasa 1 Tamat: Unload Text Encoder & Vision Encoder daripada GPU VRAM secara bersih melalui MMGP
+            act = get_active_mmgp_instance()
+            if act is not None:
+                for enc_name in ("vision_encoder", "text_encoder", "video_encoder", "clip"):
+                    safe_mmgp_unload(act, enc_name)
+            flush_vram()
+            trim_current_process_working_set()
+            self.log_telemetry_snapshot("FASA 1 TAMAT", "Text Encoder dipindahkan dari VRAM ke hos, VRAM 100% lapang untuk Transformer.")
 
         elif new_phase == "PHASE_3_DECODE":
-            # Fasa 2 Tamat: Lupus 100% Transformer & KV cache daripada VRAM dan RAM
-            if pipeline is not None:
-                trans = getattr(pipeline, "transformer", None)
-                if trans is not None:
-                    self.purge_module_completely(trans, "transformer")
-                for t2 in ("transformer2", "model", "model2"):
-                    t2_mod = getattr(pipeline, t2, None)
-                    if t2_mod is not None:
-                        self.purge_module_completely(t2_mod, t2)
-            self.log_telemetry_snapshot("FASA 2 TAMAT", "Transformer dilupuskan, VRAM & RAM Lapang untuk VAE Decode")
+            # Fasa 2 Tamat: Unload Transformer daripada GPU VRAM secara bersih melalui MMGP
+            act = get_active_mmgp_instance()
+            if act is not None:
+                for trans_name in ("transformer", "transformer2", "model", "model2"):
+                    safe_mmgp_unload(act, trans_name)
+            flush_vram()
+            trim_current_process_working_set()
+            self.log_telemetry_snapshot("FASA 2 TAMAT", "Transformer dipindahkan dari VRAM, VRAM 100% lapang untuk VAE Decode.")
 
         elif new_phase == "PHASE_IDLE":
             # Fasa 3 Tamat: Bersihkan VAE & Semua Sisa Penjanaan
@@ -1807,6 +1720,27 @@ try:
             _orig_gguf_weight_linear = s_gguf.GGUFWeightTensor.linear
             @functools.wraps(_orig_gguf_weight_linear)
             def _safe_gguf_weight_linear(self, input, bias=None):
+                target_dtype = getattr(self, "_gguf_default_dtype", None) or (input.dtype if torch.is_tensor(input) else self.dtype)
+                target_dtype = s_gguf._resolve_default_dtype(target_dtype, fallback=getattr(input, "dtype", torch.bfloat16))
+
+                # JALUR PANTAS CUDA UTAMA: Jika input di CUDA, utamakan sentiasa kernel CUDA llama.cpp
+                if torch.is_tensor(input) and input.is_cuda and s_gguf._gguf_cuda_kernels_enabled():
+                    raw = getattr(self, "_data", None)
+                    if torch.is_tensor(raw):
+                        raw_cuda = raw if raw.is_cuda else raw.to(input.device, non_blocking=True)
+                        qtype_name = s_gguf._gguf_qtype_name(getattr(self, "_tensor_type", None))
+                        mod = s_gguf._gguf_cuda_module()
+                        if mod is not None and mod.may_support_linear_qtype_name(qtype_name):
+                            try:
+                                shape = tuple(getattr(self, "_tensor_shape", self.shape))
+                                out = s_gguf._llamacpp_cuda_linear(mod, raw_cuda, qtype_name, shape, input, bias, target_dtype)
+                                s_gguf._gguf_log_once(f"llamacpp_cuda_linear_active_{qtype_name}", f"[GGUF][llama.cpp CUDA] linear fast path active for {qtype_name}.")
+                                return out
+                            except Exception as e_k:
+                                log_debug(f"[GGUF CUDA LINEAR RESCUE] Kernel gagal ({e_k}), mengalir ke fallback...")
+                            finally:
+                                if raw_cuda is not raw and not raw.is_cuda:
+                                    del raw_cuda
                 try:
                     return _orig_gguf_weight_linear(self, input, bias=bias)
                 except Exception as e_lin:
@@ -2470,7 +2404,6 @@ def centralized_model_memory_arbiter(
         )
         usable_mb = max(0.0, total_gpu_mb - total_deductions_mb)
 
-        # 9. Keputusan Bajet & Pra-muat Mengikut Peranan Model
         if model_role == "text_encoder":
             total_model_mb = total_layers * effective_block_mb + base_size_mb
             if effective_block_mb > 0 and total_model_mb <= usable_mb:
@@ -2478,9 +2411,18 @@ def centralized_model_memory_arbiter(
                 safe_budget_mb = int(total_model_mb)
                 mode_str = f"Mod Residen Penuh ({preload_blocks} blok)"
             else:
-                preload_blocks = 0
-                safe_budget_mb = int(2.0 * effective_block_mb + base_size_mb) if effective_block_mb > 0 else 256
-                mode_str = "Pure Async Shuttle (0 blok statik, 2 penimbal kerja)"
+                # Bajet Sasaran 3.xx GB VRAM (3200 MB - 3600 MB) pada RTX 5050 Laptop GPU (8GB)
+                # Memastikan blok-blok GGUF Text Encoder dimuatkan secara pantas ke CUDA untuk inferens <30s
+                target_vram_mb = min(usable_mb * 0.70, 3600.0)
+                if effective_block_mb > 0:
+                    max_blocks = max(2, int((target_vram_mb - base_size_mb) // effective_block_mb))
+                    preload_blocks = max(0, max_blocks - 2)
+                    safe_budget_mb = int(base_size_mb + max_blocks * effective_block_mb)
+                    mode_str = f"Mod Residen Berkelajuan Tinggi ({preload_blocks} blok pra-muat + 2 penimbal kerja, ~{safe_budget_mb}MB)"
+                else:
+                    preload_blocks = 0
+                    safe_budget_mb = int(target_vram_mb)
+                    mode_str = "Mod Asinkron Dinamik"
         else:
             if effective_block_mb > 0:
                 max_fit = int(usable_mb // effective_block_mb)
@@ -6640,15 +6582,15 @@ def main():
         patched_code = patched_code.replace(target_enhancer, replacement_enhancer, 1)
         log_debug("Perisai Gradio NoneType Guard (refresh_prompt_enhancer_labels) berjaya disuntik.")
 
-    # Suntikan 5: Perisai Sejagat Zero-RAM Startup (Pembersihan Awal Pasca-Muat wgp.py load_models)
+    # Suntikan 5: Pengoptimuman Pasca-Muat Bersih (Pemeliharaan Integriti Penuh Modul MMGP)
     if "return wan_model, offloadobj" in patched_code:
         patched_code = re.sub(
             r"([ \t]+)return wan_model, offloadobj[ \t]*",
-            r"\1try:\n\1    CentralizedUniversalLifecycleManager.get_instance().on_model_loaded(wan_model, offloadobj)\n\1except Exception as _mgr_err:\n\1    pass\n\1return wan_model, offloadobj",
+            r"\1try:\n\1    flush_vram()\n\1    trim_current_process_working_set()\n\1except Exception:\n\1    pass\n\1return wan_model, offloadobj",
             patched_code,
             count=1
         )
-        log_debug("Perisai Sejagat Zero-RAM Startup (Pembersihan Awal Pasca-Muat) berjaya disuntik ke wgp.py!")
+        log_debug("Perisai Pasca-Muat Bersih (Pemeliharaan Model MMGP) berjaya disuntik ke wgp.py!")
 
     # Jalankan wgp.py dalam konteks __main__
     exec(patched_code, main_module.__dict__)
