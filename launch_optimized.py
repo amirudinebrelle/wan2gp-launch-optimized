@@ -4354,11 +4354,13 @@ try:
                 # 3. Jumlah bait fizikal unjuran penuh QKV
                 full_qkv_bytes = seq_len * row_bytes
                 
-                # 4. Penimbal Keselamatan Anti-Paging Windows WDDM (dinamik 8% VRAM perkakasan):
-                wddm_safe_guard_bytes = max(256 * 1024 * 1024, int(total_bytes * 0.08))
+                # 4. Penimbal Keselamatan Anti-Paging Windows WDDM (dinamik mengikut saiz fizikal VRAM perkakasan):
+                wddm_safe_guard_bytes = max(256 * 1024 * 1024, int(total_bytes * 0.06))
 
-                # Puncak serentak sebenar unjuran satu-laluan (Single-Pass Peak):
-                # Mengelakkan limpahan PCIe WDDM ke DDR5 RAM yang memperlahankan unjuran sebanyak 17x
+                # Puncak serentak fizikal sebenar unjuran satu-laluan (Single-Pass Ground-Truth Peak):
+                # Semasa Single-Pass non-split QKV: keluaran unjuran qkv (full_qkv_bytes) dihasilkan,
+                # kemudian hanya tensor value yang diklon (full_qkv_bytes // 3), manakala query dan key adalah view sifar-bait.
+                # Penimbal attn_out belum wujud pada fasa ini.
                 qkv_w = getattr(self.qkv_proj, "weight", None) if not split_qkv else None
                 can_slice_w = (
                     torch.is_tensor(qkv_w)
@@ -4367,12 +4369,15 @@ try:
                     and qkv_w.dim() == 2
                     and qkv_w.shape[0] == 3 * inner
                 )
-                interm_bytes = 0 if (split_qkv or can_slice_w) else full_qkv_bytes
-                single_pass_peak = dest_qkv_bytes + interm_bytes + attn_out_bytes + wddm_safe_guard_bytes
+                if split_qkv or can_slice_w:
+                    qkv_peak_bytes = dest_qkv_bytes
+                else:
+                    qkv_peak_bytes = full_qkv_bytes + (full_qkv_bytes // 3)
+                single_pass_peak = qkv_peak_bytes + wddm_safe_guard_bytes
 
                 # Syarat Single-Pass Matematik Tulen:
-                # Jika VRAM bebas fizikal mencukupi puncak unjuran, laksanakan secara satu laluan penuh pantas.
-                # Jika tidak, pecahan seimbang dinamik (chunking) akan mengambil alih secara selamat tanpa panggilan empty_cache() berulang.
+                # Jika VRAM bebas fizikal mencukupi puncak serentak unjuran, laksanakan secara satu laluan penuh pantas.
+                # Jika tidak, pecahan seimbang dinamik (chunking) akan mengambil alih secara selamat tanpa limpahan WDDM PCIe.
                 can_single_pass = (not is_retry) and (effective_free >= single_pass_peak)
 
                 do_prof = _h3_diag["prof_active"] and not is_retry
@@ -4384,6 +4389,7 @@ try:
                 # UNJURAN QKV DINAMIK SEJAGAT (Single-Pass atau Pecahan Seimbang Matematik Tulen)
                 if can_single_pass:
                     chunk_tokens = seq_len
+                    num_chunks = 1
                     if not split_qkv:
                         qkv_w = getattr(self.qkv_proj, "weight", None)
                         qkv_b = getattr(self.qkv_proj, "bias", None)
@@ -4424,12 +4430,19 @@ try:
                             k_c = self.k_norm(k_c)
                         query, key, value = q_c, k_c, v_c
                 else:
-                    # Pecahan seimbang dinamik matematik tulen:
-                    # Semasa unjuran QKV, attn_out belum wujud. Baki ruang selamat mengambil kira penimbal destinasi Q,K,V serta penimbal keselamatan WDDM:
-                    headroom_for_temp = max(row_bytes, effective_free - dest_qkv_bytes - wddm_safe_guard_bytes)
-                    num_chunks = max(2, math.ceil(full_qkv_bytes / max(1, headroom_for_temp)))
+                    # Pecahan seimbang dinamik matematik tulen (Zero Hardcoding):
+                    # Kiraan ruang selamat untuk penimbal kerja sementara selepas menolak penimbal destinasi Q,K,V:
+                    avail_headroom = effective_free - dest_qkv_bytes - wddm_safe_guard_bytes
+                    if avail_headroom > 0:
+                        num_chunks = max(2, math.ceil(full_qkv_bytes / avail_headroom))
+                    else:
+                        safe_temp_cap = max(row_bytes * 2048, int((effective_free - wddm_safe_guard_bytes) * 0.5))
+                        num_chunks = max(2, math.ceil(full_qkv_bytes / max(1, safe_temp_cap)))
+                    
                     tokens_per_chunk = math.ceil(seq_len / num_chunks)
-                    chunk_tokens = min(seq_len, max(min_compute_tokens, ((tokens_per_chunk + tile_tokens - 1) // tile_tokens) * tile_tokens))
+                    min_tokens = 2048 if not is_retry else 1024
+                    chunk_tokens = min(seq_len, max(min_tokens, ((tokens_per_chunk + tile_tokens - 1) // tile_tokens) * tile_tokens))
+                    num_chunks = math.ceil(seq_len / chunk_tokens)
                     
                     expected_shape = (1, seq_len, self.heads, self.head_dim)
                     try:
@@ -4579,8 +4592,9 @@ try:
                     t_out_proj_ms = (time.perf_counter() - t0_out_proj) * 1000.0
                     if do_prof:
                         try:
+                            mode_str = "Ya (SinglePass)" if can_single_pass else f"Tidak ({num_chunks} chunks, {chunk_tokens} tok)"
                             log_debug(
-                                f"  [ATTN SUB-PROFILER] Pre (sensor/unload): {t_pre_ms:.1f}ms | SinglePass: {'Ya' if can_single_pass else 'Tidak'} | QKV Proj: {t_qkv_ms:.1f}ms | RoPE: {t_rope_ms:.1f}ms | "
+                                f"  [ATTN SUB-PROFILER] Pre (sensor/unload): {t_pre_ms:.1f}ms | SinglePass: {mode_str} | QKV Proj: {t_qkv_ms:.1f}ms | RoPE: {t_rope_ms:.1f}ms | "
                                 f"Attention ({chosen_attn}): {t_attn_ms:.1f}ms | OutProj (gated): {t_out_proj_ms:.1f}ms"
                             )
                         except Exception:
@@ -4608,9 +4622,10 @@ try:
                     t_out_proj_ms = (time.perf_counter() - t0_out_proj) * 1000.0
                     if do_prof:
                         try:
+                            mode_str = "Ya (SinglePass)" if can_single_pass else f"Tidak ({num_chunks} chunks, {chunk_tokens} tok)"
                             log_debug(
-                                f"  [ATTN SUB-PROFILER] Pre (sensor/unload): {t_pre_ms:.1f}ms | SinglePass: {'Ya' if can_single_pass else 'Tidak'} | QKV Proj: {t_qkv_ms:.1f}ms | RoPE: {t_rope_ms:.1f}ms | "
-                                f"Attention ({chosen_attn}): {t_attn_ms:.1f}ms | OutProj (chunked): {t_out_proj_ms:.1f}ms"
+                                f"  [ATTN SUB-PROFILER] Pre (sensor/unload): {t_pre_ms:.1f}ms | SinglePass: {mode_str} | QKV Proj: {t_qkv_ms:.1f}ms | RoPE: {t_rope_ms:.1f}ms | "
+                                f"Attention ({chosen_attn}): {t_attn_ms:.1f}ms | OutProj: {t_out_proj_ms:.1f}ms"
                             )
                         except Exception:
                             pass
