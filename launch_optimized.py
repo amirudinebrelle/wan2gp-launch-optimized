@@ -2211,8 +2211,9 @@ def centralized_model_memory_arbiter(
             info = inspect_model_data(mod_obj)
 
         hidden_dim = info.get("hidden_dim", 0) or 3072
-        inner_dim = info.get("inner_dim", 0) or hidden_dim
-        total_layers = max(1, info.get("layers", 1))
+        total_layers = info.get("layers", 0)
+        if total_layers <= 1:
+            total_layers = 50 if model_role == "text_encoder" else (36 if (mod_obj is not None and "minimax" in str(type(mod_obj)).lower()) else 30)
         block_size_mb = info.get("block_size_mb", 0.0) or info.get("block_storage_mb", 0.0)
         base_size_mb = info.get("base_size_mb", 0.0)
         is_quant = info.get("is_quant", False)
