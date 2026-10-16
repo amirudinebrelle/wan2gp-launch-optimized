@@ -475,7 +475,7 @@ def _safe_cuda_empty_cache(*args, **kwargs):
     # empty_cache_if_needed di mmgp/offload.py memanggil empty_cache setiap kali reserved memori > 90%
     # Pada Windows WDDM, ini memaksa pembekuan GPU selama 20-40 saat setiap blok kerana page table flush.
     # Sekat panggilan pencegahan ini jika VRAM fizikal GPU masih mempunyai baki alokasi selamat (> 128MB).
-    if caller_fn == "empty_cache_if_needed" or "offload.py" in caller_file:
+    if caller_fn == "empty_cache_if_needed":
         return
 
     _t0 = time.perf_counter()
@@ -733,18 +733,30 @@ def safe_mmgp_unload(active_instance, target_key):
                     active_instance.auto_preload.on_unload(all_mids)
                 except Exception:
                     pass
-            # 5. Pindahkan sebarang parameter dan buffer CUDA model berdaftar ke CPU secara mutlak
+            # 5. Pindahkan sebarang parameter dan buffer CUDA model berdaftar ke CPU secara mutlak & potong storan fizikal
             for mid in all_mids:
                 m_obj = active_instance.models.get(mid)
                 if m_obj is not None and hasattr(m_obj, "parameters"):
                     for p in m_obj.parameters():
                         if p is not None and getattr(p, "is_cuda", False):
                             try:
+                                st = p.untyped_storage()
+                                if st.is_cuda and st.size() > 0:
+                                    st.resize_(0)
+                            except Exception:
+                                pass
+                            try:
                                 p.data = p.data.to("cpu")
                             except Exception:
                                 pass
                     for b in m_obj.buffers():
                         if b is not None and getattr(b, "is_cuda", False):
+                            try:
+                                st = b.untyped_storage()
+                                if st.is_cuda and st.size() > 0:
+                                    st.resize_(0)
+                            except Exception:
+                                pass
                             try:
                                 b.data = b.data.to("cpu")
                             except Exception:
@@ -839,17 +851,29 @@ def safe_mmgp_unload(active_instance, target_key):
                         active_instance.auto_preload.on_unload([model_id])
                     except Exception:
                         pass
-                # Pindahkan sebarang parameter dan buffer CUDA modul ini ke CPU
+                # Pindahkan sebarang parameter dan buffer CUDA modul ini ke CPU & potong storan fizikal
                 m_obj = active_instance.models.get(model_id)
                 if m_obj is not None and hasattr(m_obj, "parameters"):
                     for p in m_obj.parameters():
                         if p is not None and getattr(p, "is_cuda", False):
+                            try:
+                                st = p.untyped_storage()
+                                if st.is_cuda and st.size() > 0:
+                                    st.resize_(0)
+                            except Exception:
+                                pass
                             try:
                                 p.data = p.data.to("cpu")
                             except Exception:
                                 pass
                     for b in m_obj.buffers():
                         if b is not None and getattr(b, "is_cuda", False):
+                            try:
+                                st = b.untyped_storage()
+                                if st.is_cuda and st.size() > 0:
+                                    st.resize_(0)
+                            except Exception:
+                                pass
                             try:
                                 b.data = b.data.to("cpu")
                             except Exception:
@@ -867,6 +891,10 @@ def safe_mmgp_unload(active_instance, target_key):
                     mmgp_ram.release()
                 except Exception:
                     pass
+                if torch.cuda.is_available():
+                    _alloc_mb = torch.cuda.memory_allocated() / 1048576
+                    _res_mb = torch.cuda.memory_reserved() / 1048576
+                    log_debug(f"[TELEMETRI UNLOAD {target_key}] Baki Alokasi: {_alloc_mb:.1f}MB | Reserved: {_res_mb:.1f}MB (Telus, Sifar Spekulasi)")
     except Exception as e:
         log_debug(f"Pengecualian semasa safe_mmgp_unload: {e}")
 
@@ -5747,6 +5775,74 @@ def main():
     if target_terminal_error in patched_code:
         patched_code = patched_code.replace(target_terminal_error, replacement_terminal_error, 1)
         log_debug("Perisai Pembersihan Mutlak Terminal Pasca-Ralat (Terminal Error Clean) berjaya disuntik.")
+
+    # Suntikan 3c: Pembersihan Mutlak Pasca-Batal Pengguna (Pemicu serta-merta apabila Pengguna membatalkan penjanaan)
+    target_queue_abort = '''                if abort:
+                    notification_run.interrupt("Generation aborted by the user.", aborted=True)
+                    send_cmd("status", "Video Generation Aborted")
+                    send_cmd("output", None)'''
+
+    replacement_queue_abort = '''                if abort:
+                    notification_run.interrupt("Generation aborted by the user.", aborted=True)
+                    send_cmd("status", "Video Generation Aborted")
+                    send_cmd("output", None)
+                    try:
+                        if "_universal_deep_clean_memory" in globals():
+                            globals()["_universal_deep_clean_memory"]("PASCA-BATAL-PENGGUNA")
+                    except Exception:
+                        pass'''
+
+    if target_queue_abort in patched_code:
+        patched_code = patched_code.replace(target_queue_abort, replacement_queue_abort, 1)
+        log_debug("Perisai Pembersihan Mutlak Pasca-Batal Pengguna (User Abort Deep Clean) berjaya disuntik.")
+
+    # Suntikan 3d: Pembersihan Mutlak Pasca-Release-Gen (Setiap kali pusingan giliran selesai sepenuhnya)
+    target_release_gen = '''    def release_gen():
+        set_main_generation_running(state, False)
+        with gen_lock:
+            process_status = gen.get("process_status", None)
+            if isinstance(process_status, str) and process_status.startswith("request:"):
+                gen["process_status"] = "process:" + process_status[len("request:"):]
+            else:
+                gen["process_status"] = None'''
+
+    replacement_release_gen = '''    def release_gen():
+        set_main_generation_running(state, False)
+        with gen_lock:
+            process_status = gen.get("process_status", None)
+            if isinstance(process_status, str) and process_status.startswith("request:"):
+                gen["process_status"] = "process:" + process_status[len("request:"):]
+            else:
+                gen["process_status"] = None
+        try:
+            if "_universal_deep_clean_memory" in globals():
+                globals()["_universal_deep_clean_memory"]("PASCA-RELEASE-GEN")
+        except Exception:
+            pass'''
+
+    if target_release_gen in patched_code:
+        patched_code = patched_code.replace(target_release_gen, replacement_release_gen, 1)
+        log_debug("Perisai Pembersihan Mutlak Pasca-Release-Gen (Release Gen Deep Clean) berjaya disuntik.")
+
+    # Suntikan 3e: Pembersihan Mutlak Pasca-Worker-Exit (Sebaik sahaja queue worker thread tamat di blok finally)
+    target_worker_exit = '''        finally:
+            with lock:
+                gen.pop("api_active_queue_task", None)
+            send_cmd("worker_exit", None)'''
+
+    replacement_worker_exit = '''        finally:
+            with lock:
+                gen.pop("api_active_queue_task", None)
+            try:
+                if "_universal_deep_clean_memory" in globals():
+                    globals()["_universal_deep_clean_memory"]("PASCA-WORKER-EXIT")
+            except Exception:
+                pass
+            send_cmd("worker_exit", None)'''
+
+    if target_worker_exit in patched_code:
+        patched_code = patched_code.replace(target_worker_exit, replacement_worker_exit, 1)
+        log_debug("Perisai Pembersihan Mutlak Pasca-Worker-Exit (Worker Exit Deep Clean) berjaya disuntik.")
 
     # Suntikan 4: Perisai Gradio NoneType Guard (Anti-Spam TypeError Console)
     target_enhancer = '''def refresh_prompt_enhancer_labels(state, metadata, *, tab_id="generate"):
