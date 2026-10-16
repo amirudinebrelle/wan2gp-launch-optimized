@@ -1596,18 +1596,14 @@ def compute_dynamic_transformer_budget(transformer_module=None, is_async=True, p
             visual_tokens = patch_h * patch_w * patch_t
             text_tokens = 512
             # Pengesanan Dinamik Saluran Modaliti Fizikal Tulen (Zero Hardcoding):
-            # 1 saluran asas video sasaran.
-            # Saluran tambahan dikesan mengikut komponen aktif (Ref2VA/Continuation, Audio Latents, Token Refiner).
-            active_channels = 1.0
-            if getattr(transformer_module, "reference_mode", False) or getattr(transformer_module, "control_layers", None):
-                active_channels += 1.0
-            fl = getattr(transformer_module, "final_layer", None)
-            if not is_audio and fl is not None and hasattr(fl, "audio_out"):
-                active_channels += 1.0
-            if hasattr(transformer_module, "token_refiner") and getattr(transformer_module, "token_refiner", None) is not None:
-                active_channels += 1.0
-            channel_multiplier = max(active_channels, float(token_scaling_ratio))
-            total_tokens = int((visual_tokens + text_tokens) * channel_multiplier)
+            # 1 saluran visual video sasaran. Saluran tambahan visual dikesan jika mod rujukan/lanjutan aktif.
+            is_ref = bool(getattr(transformer_module, "reference_mode", False) or getattr(transformer_module, "control_layers", None))
+            visual_channel_mult = 2.0 if is_ref else 1.0
+            if token_scaling_ratio and 1.0 < float(token_scaling_ratio) <= 2.5:
+                visual_channel_mult = float(token_scaling_ratio)
+            # Token pembantu teks (~512) dan audio laten (~250-512 jika model multimodal video-audio)
+            aux_tokens = 512 + (512 if not is_audio and getattr(transformer_module, "final_layer", None) is not None and hasattr(getattr(transformer_module, "final_layer"), "audio_out") else 0)
+            total_tokens = int(visual_tokens * visual_channel_mult + aux_tokens)
             if _generation_state.get("active_seq_len"):
                 total_tokens = int(_generation_state["active_seq_len"])
 
@@ -1691,50 +1687,53 @@ def compute_dynamic_transformer_budget(transformer_module=None, is_async=True, p
         base_block_mb = block_storage_mb if (is_quant and block_storage_mb > 0) else (block_dequant_mb if block_dequant_mb > 0 else info.get("block_size_mb", 0.0))
         effective_block_mb = base_block_mb + lora_per_block_mb
         
-        # 5. Overhead Fragmentasi PyTorch & Ruang Nyahkuantisasi Kuantum (100% Zero Hardcoding)
-        # Baki VRAM bebas masa-nyata (free_mb) daripada mem_get_info() sudah tepat menolak
-        # keseluruhan memori yang digunakan oleh Windows OS, DWM, dan aplikasi latar belakang.
+        # 5. Analisis Memori Fizikal Sebenar (Hardware Ground-Truth, 100% Zero Hardcoding)
+        # Baki VRAM bebas masa-nyata (free_mb) daripada mem_get_info() adalah memori fizikal bebas pada cip GDDR6.
+        # ext_os_mb adalah memori yang diduduki oleh konteks pemandu Nvidia dan proses OS luar.
+        total_gpu_mb = (torch.cuda.get_device_properties(0).total_memory / (1024 * 1024)) if torch.cuda.is_available() else 8192.0
         alloc_bytes = torch.cuda.memory_allocated()
         res_bytes = torch.cuda.memory_reserved()
         allocator_frag_mb = max(0.0, (res_bytes - alloc_bytes) / (1024 * 1024))
         
-        # Sukat penggunaan VRAM sistem luar / DWM masa-nyata secara langsung (bukan andaian)
-        total_gpu_mb = (torch.cuda.get_device_properties(0).total_memory / (1024 * 1024)) if torch.cuda.is_available() else 8192.0
+        # Penggunaan memori GPU luar secara tepat (total - free - reserved)
         ext_os_mb = max(0.0, ((total_gpu_mb * 1024 * 1024 - free_bytes) - res_bytes) / (1024 * 1024))
         
-        # Granulariti penimbal segmen CUDA perkakasan fizikal (standard CUDA 2MB segment granularity)
+        # Granulariti penimbal perkakasan segmen CUDA (standard CUDA 2MB segment granularity)
         allocator_quantum_mb = 2.0
         
-        # Ruang kerja nyahkuantisasi kernel (hanya 1 lapisan linear terbesar dinyahkuantisasi pada satu-satu masa)
+        # Ruang kerja nyahkuantisasi kernel (hanya 1 lapisan linear terbesar dinyahkuantisasi serentak)
         dequant_workspace_mb = (max_layer_dequant_mb * 1.0) if is_quant else 0.0
         
         # 6. Formula Ruang Simpanan Bersih Pra-muat Tulen (100% Zero Hardcoding, Sifar Anggaran Kasar / Peratusan Tiruan)
         # Menjamin VRAM tidak melimpah ke PCIe Shared Memory dan DWM kekal lancar
         # Gabungkan denyutan aktivasi puncak sebenar (Dynamic Activation Breathing Pulse) dengan headroom algebra
         observed_pulse = float(_generation_state.get("real_act_pulse_mb", 0.0))
-        if attn_headroom_mb > 0:
-            effective_act_headroom_mb = max(observed_pulse, attn_headroom_mb)
+        if observed_pulse > 0:
+            effective_act_headroom_mb = observed_pulse
+        elif attn_headroom_mb > 0:
+            # Hadkan anggaran algebra kepada kapasiti fizikal silikon maksimum yang munasabah bagi GPU
+            max_possible_act = max(512.0, total_gpu_mb - ext_os_mb - base_size_mb - effective_block_mb - 512.0)
+            effective_act_headroom_mb = min(attn_headroom_mb, max_possible_act)
         else:
-            effective_act_headroom_mb = max(observed_pulse, float((total_tokens * hidden_dim * elem_size * 4) / (1024 * 1024)))
+            effective_act_headroom_mb = max(512.0, float((total_tokens * hidden_dim * elem_size * 4) / (1024 * 1024)))
         
-        # Penimbal Keselamatan Pemacu Dinamik Fizikal Tulen (100% Zero Hardcoding):
-        # Mengukur beban sebenar pemacu OS (ext_os_mb) + serpihan alokator PyTorch (allocator_frag_mb)
-        # bersama had selamat kuantum perkakasan CUDA secara langsung tanpa sebarang pemalar tiruan.
-        driver_safe_headroom_mb = ext_os_mb + allocator_frag_mb + allocator_quantum_mb
+        # Penimbal Keselamatan Pemacu Dinamik & WDDM (100% Zero Hardcoding):
+        # Margin keselamatan fizikal mengelakkan WDDM PCIe paging:
+        # Serpihan alokator PyTorch sebenar + saiz 1 blok penimbal pemindahan DMA + kuantum perkakasan CUDA
+        wddm_safe_guard_mb = max(256.0, allocator_frag_mb + effective_block_mb + allocator_quantum_mb)
         
-        # Had Siling Fizikal Mutlak: VRAM Model dilarang menolak aktivasi melepasi kapasiti GDDR6 perkakasan
-        pytorch_safe_ceiling_mb = max(
-            512.0,
-            total_gpu_mb - ext_os_mb - driver_safe_headroom_mb - effective_act_headroom_mb - dequant_workspace_mb - lora_guard_mb - allocator_quantum_mb
+        # Kapasiti Bersih Storan Blok Transformer Fizikal (100% Zero Hardcoding, Sifar Dwi-Tolak):
+        # Jumlah Memori GPU fizikal (total_gpu_mb) ditolak:
+        # 1. ext_os_mb (OS & Konteks Pemandu)
+        # 2. base_size_mb + aux_submodels_mb (Modul tapak & pembantu transformer)
+        # 3. effective_act_headroom_mb (Denyutan aktivasi puncak forward pass)
+        # 4. dequant_workspace_mb (Ruang kerja nyahkuantisasi kernel)
+        # 5. lora_guard_mb (Berat LoRA aktif)
+        # 6. wddm_safe_guard_mb (Penimbal anti-paging Windows WDDM)
+        usable_storage_mb = max(
+            0.0,
+            (total_gpu_mb - ext_os_mb) - base_size_mb - aux_submodels_mb - effective_act_headroom_mb - dequant_workspace_mb - lora_guard_mb - wddm_safe_guard_mb
         )
-        
-        # Ruang yang benar-benar selamat untuk model (base + blok)
-        max_model_safe_mb = min(
-            pytorch_safe_ceiling_mb,
-            free_mb - driver_safe_headroom_mb - allocator_quantum_mb - effective_act_headroom_mb - dequant_workspace_mb - lora_guard_mb
-        )
-        
-        usable_storage_mb = max(0.0, max_model_safe_mb - base_size_mb - aux_submodels_mb)
         
         if effective_block_mb > 0:
             total_block_capacity = int(usable_storage_mb // effective_block_mb)
@@ -1752,11 +1751,12 @@ def compute_dynamic_transformer_budget(transformer_module=None, is_async=True, p
                 budget_mb = int(effective_block_mb + base_size_mb)
             num_blocks = preload_blocks
         else:
-            budget_mb = int(max_model_safe_mb) if max_model_safe_mb > base_size_mb else 512
+            budget_mb = int(usable_storage_mb) if usable_storage_mb > base_size_mb else 512
             num_blocks = 0
             
         # Pengikat Integriti Fizikal Mutlak: Bajet model dilarang sama sekali melepasi siling keselamatan fizikal
-        budget_mb = max(int(base_size_mb + (effective_block_mb if effective_block_mb > 0 else 0)), min(budget_mb, int(max_model_safe_mb)))
+        max_safe_budget_mb = int(max(base_size_mb, usable_storage_mb + base_size_mb))
+        budget_mb = max(int(base_size_mb + (effective_block_mb if effective_block_mb > 0 else 0)), min(budget_mb, max_safe_budget_mb))
             
         modaliti_str = "Audio" if is_audio else ("Imej" if is_image_2d else "Video")
         log_debug(
@@ -3880,8 +3880,8 @@ try:
                         cur_h = getattr(self, "_current_height", None)
                         cur_w = getattr(self, "_current_width", None)
                         cur_fn = getattr(self, "_current_frame_num", None)
-                        # Nisbah modaliti fizikal tulen: 4.0 saluran bagi mod rujukan/sambung video (target + rujukan + audio + token refiner)
-                        channel_ratio = 4.0 if is_ref_mode else 1.0
+                        # Nisbah modaliti visual fizikal: 2.0 saluran bagi mod rujukan/sambung video (target + rujukan)
+                        channel_ratio = 2.0 if is_ref_mode else 1.0
                         retune_active_model_dynamically(active_inst, phase=1, token_scaling_ratio=channel_ratio, is_audio_only=is_audio, height=cur_h, width=cur_w, frame_num=cur_fn)
 
                     # 6. Laporan Telemetri RAM Masa-Nyata Telus
@@ -4512,6 +4512,21 @@ try:
                 if peak_mb > alloc_mb:
                     pulse_mb = peak_mb - alloc_mb
                     _generation_state["real_act_pulse_mb"] = max(float(_generation_state.get("real_act_pulse_mb", 0.0)), float(pulse_mb))
+                    
+                    # Kalibrasi Dinamik Bajet MMGP Selepas Pengukuran Empirikal Blok Pertama (Zero Hardcoding)
+                    if step == 1 and blk == 0 and not _generation_state.get("calibrated_budget"):
+                        _generation_state["calibrated_budget"] = True
+                        try:
+                            act_inst = get_active_mmgp_instance()
+                            if act_inst is not None and hasattr(act_inst, "budgets") and isinstance(act_inst.budgets, dict):
+                                trans_mod = getattr(self, "transformer", None) or self
+                                tuned_b = compute_dynamic_transformer_budget(trans_mod, is_async=True, phase=1)
+                                if tuned_b > act_inst.budgets.get("transformer", 0):
+                                    act_inst.budgets["transformer"] = tuned_b
+                                    act_inst.budgets["*"] = tuned_b
+                                    log_debug(f"[KALIBRASI DINAMIK MMGP] Bajet VRAM dilaras semula secara empirikal mengikut denyutan aktivasi ({pulse_mb:.0f}MB): {tuned_b}MB.")
+                        except Exception as cal_err:
+                            log_debug(f"Notis kalibrasi bajet MMGP: {cal_err}")
             else:
                 free_b, alloc_mb, res_mb, peak_mb = 0, 0.0, 0.0, 0.0
             log_debug(
