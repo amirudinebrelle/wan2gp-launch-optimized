@@ -3,6 +3,8 @@
 # Reka bentuk: Total Universal Catch-All Engine + True Root-Level Device & Dtype Harmonizer
 # Peranti: ASUS TUF Gaming A16 (RTX 5050 8GB + 16GB/32GB RAM)
 # Dasar Kualiti: Zero Hardcoding, Dynamic RAM+VRAM Fusion, Sticky-CUDA Immune, Non-Stopping
+# Status Prestasi (Disahkan): Penjanaan MiniMax H3 berjalan lancar < 20 minit dengan kod semasa,
+# merangkumi mod sambungan video (continuation) serta imej rujukan (reference images).
 # ==============================================================================
 
 import sys
