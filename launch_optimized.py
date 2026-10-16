@@ -310,26 +310,35 @@ def evict_h3_auxiliary_modules(container):
     evicted_total = 0
     try:
         active_inst = get_active_mmgp_instance()
-        for mod_id in ("video_encoder", "vae", "audio_vae", "latent_upscaler"):
+        for mod_id in ("text_encoder", "vision_encoder", "video_encoder", "video_decoder", "vae", "audio_vae", "latent_upscaler"):
             if active_inst is not None:
                 try:
                     safe_mmgp_unload(active_inst, mod_id)
                     evicted_total += 1
                 except Exception:
                     pass
-        # Untuk text_encoder: HANYA alihkan embed_tokens.weight jika ia berada di CUDA!
-        # JANGAN panggil .to("cpu") ke atas keseluruhan model 32B (GGUF mmap) yang menyebabkan sangkut/freeze.
+        # Alihkan sebarang parameter & buffer CUDA milik text_encoder (language_model & visual) ke CPU
         te = getattr(container, "text_encoder", None)
         if te is not None:
-            lm = getattr(te, "language_model", None)
-            if lm is not None and hasattr(lm, "embed_tokens"):
-                et = lm.embed_tokens
-                if hasattr(et, "weight") and et.weight is not None and et.weight.is_cuda:
-                    try:
-                        et.to("cpu")
-                        evicted_total += 1
-                    except Exception:
-                        pass
+            for sub_m in (getattr(te, "language_model", None), getattr(te, "visual", None), te):
+                if sub_m is not None and hasattr(sub_m, "parameters"):
+                    for p in sub_m.parameters():
+                        if p is not None and getattr(p, "is_cuda", False):
+                            try:
+                                p.data = p.data.to("cpu")
+                                evicted_total += 1
+                            except Exception:
+                                pass
+                    for b in sub_m.buffers():
+                        if b is not None and getattr(b, "is_cuda", False):
+                            try:
+                                b.data = b.data.to("cpu")
+                            except Exception:
+                                pass
+            if hasattr(container, "text_encoder_cache"):
+                c = getattr(container, "text_encoder_cache", None)
+                if c is not None and hasattr(c, "clear"):
+                    c.clear()
         flush_vram()
         if evicted_total > 0:
             log_debug(f"[OFFLOAD PEMBANTU] Modul pembantu dipunggah bersih menerusi MMGP (VRAM 100% bebas untuk Transformer).")
@@ -699,6 +708,18 @@ def safe_mmgp_unload(active_instance, target_key):
             # 4. Bersihkan penimbal block_slots, slot_views, cuda_graphs & staging ring
             if hasattr(active_instance, "block_slots"):
                 try:
+                    for slots in list(active_instance.block_slots.values()):
+                        if slots:
+                            for s in slots:
+                                if isinstance(s, list) and len(s) > 0 and s[0] is not None:
+                                    if torch.is_tensor(s[0]) and s[0].is_cuda:
+                                        try:
+                                            st = s[0].untyped_storage()
+                                            if st.is_cuda and st.size() > 0:
+                                                st.resize_(0)
+                                        except Exception:
+                                            pass
+                                    s[0] = None
                     active_instance.block_slots.clear()
                 except Exception:
                     pass
@@ -707,6 +728,27 @@ def safe_mmgp_unload(active_instance, target_key):
                     active_instance.slot_views.clear()
                 except Exception:
                     pass
+            if hasattr(active_instance, "auto_preload") and active_instance.auto_preload is not None:
+                try:
+                    active_instance.auto_preload.on_unload(all_mids)
+                except Exception:
+                    pass
+            # 5. Pindahkan sebarang parameter dan buffer CUDA model berdaftar ke CPU secara mutlak
+            for mid in all_mids:
+                m_obj = active_instance.models.get(mid)
+                if m_obj is not None and hasattr(m_obj, "parameters"):
+                    for p in m_obj.parameters():
+                        if p is not None and getattr(p, "is_cuda", False):
+                            try:
+                                p.data = p.data.to("cpu")
+                            except Exception:
+                                pass
+                    for b in m_obj.buffers():
+                        if b is not None and getattr(b, "is_cuda", False):
+                            try:
+                                b.data = b.data.to("cpu")
+                            except Exception:
+                                pass
             if hasattr(active_instance, "cuda_graphs"):
                 try:
                     for graphs in list(active_instance.cuda_graphs.values()):
@@ -776,9 +818,43 @@ def safe_mmgp_unload(active_instance, target_key):
                             active_instance.gpu_unload_blocks(model_id, entry[len(model_id) + 1:])
                         except Exception:
                             pass
+                # Lepaskan VRAM slot buffer dan slot views modul ini dari MMGP
+                if hasattr(active_instance, "block_slots") and model_id in active_instance.block_slots:
+                    slots = active_instance.block_slots.pop(model_id, None)
+                    if slots:
+                        for s in slots:
+                            if isinstance(s, list) and len(s) > 0 and s[0] is not None:
+                                if torch.is_tensor(s[0]) and s[0].is_cuda:
+                                    try:
+                                        st = s[0].untyped_storage()
+                                        if st.is_cuda and st.size() > 0:
+                                            st.resize_(0)
+                                    except Exception:
+                                        pass
+                                s[0] = None
+                if hasattr(active_instance, "slot_views") and active_instance.slot_views:
+                    active_instance.slot_views = {k: v for k, v in active_instance.slot_views.items() if not k[0].startswith(model_id + "/") and k[0] != model_id}
+                if hasattr(active_instance, "auto_preload") and active_instance.auto_preload is not None:
+                    try:
+                        active_instance.auto_preload.on_unload([model_id])
+                    except Exception:
+                        pass
+                # Pindahkan sebarang parameter dan buffer CUDA modul ini ke CPU
+                m_obj = active_instance.models.get(model_id)
+                if m_obj is not None and hasattr(m_obj, "parameters"):
+                    for p in m_obj.parameters():
+                        if p is not None and getattr(p, "is_cuda", False):
+                            try:
+                                p.data = p.data.to("cpu")
+                            except Exception:
+                                pass
+                    for b in m_obj.buffers():
+                        if b is not None and getattr(b, "is_cuda", False):
+                            try:
+                                b.data = b.data.to("cpu")
+                            except Exception:
+                                pass
                 # Segerakkan active_models_ids dan active_models secara dinamik:
-                # Memastikan MMGP mengetahui model ini tidak lagi di GPU,
-                # supaya ensure_model_loaded(model_id) memuatkannya ke GPU secara sah jika dipanggil kemudian.
                 if hasattr(active_instance, "active_models_ids"):
                     while model_id in active_instance.active_models_ids:
                         active_instance.active_models_ids.remove(model_id)
@@ -1527,6 +1603,27 @@ def compute_dynamic_transformer_budget(transformer_module=None, is_async=True, p
                         aux_submodels_mb += sub_bytes / (1024 * 1024)
             except Exception:
                 pass
+
+        # Ground-truth memori alokasi CUDA aktif semasa (seperti tensor conditioning context ~466MB):
+        # Mengelakkan bajet blok transformer melimpah melepasi VRAM GDDR6 fizikal semasa denyutan aktivasi attention.
+        try:
+            if torch.cuda.is_available():
+                cur_alloc_mb = float(torch.cuda.memory_allocated() / (1024 * 1024))
+                loaded_trans_mb = 0.0
+                if act is not None and hasattr(act, "blocks_of_modules_sizes"):
+                    main_id = getattr(act, "main_model_id", "transformer")
+                    preloaded = act.preloaded_blocks_per_model.get(main_id, ()) if hasattr(act, "preloaded_blocks_per_model") else ()
+                    for b in preloaded:
+                        entry = main_id + "/" + b
+                        loaded_trans_mb += act.blocks_of_modules_sizes.get(entry, 0.0) / (1024 * 1024)
+                    cur_b = act.loaded_blocks.get(main_id) if hasattr(act, "loaded_blocks") else None
+                    if cur_b is not None:
+                        entry = main_id + "/" + cur_b
+                        loaded_trans_mb += act.blocks_of_modules_sizes.get(entry, 0.0) / (1024 * 1024)
+                non_trans_mb = max(0.0, cur_alloc_mb - loaded_trans_mb)
+                aux_submodels_mb = max(aux_submodels_mb, non_trans_mb)
+        except Exception:
+            pass
         aux_submodels_mb = max(0.0, aux_submodels_mb)
 
         # 2. Pengesanan Modaliti Dinamik Sejagat (Audio vs Imej 2D vs Video 3D)
@@ -3984,24 +4081,8 @@ try:
                 _orig_use_trans(self)
                 try:
                     active_inst = get_active_mmgp_instance()
-                    # 1. Pindahkan sebarang tensor CUDA modul pembantu ke CPU secara mutlak
-                    for mod_name in ("text_encoder", "vision_encoder", "video_encoder", "audio_vae", "vae", "latent_upscaler"):
-                        mod = getattr(self, mod_name, None)
-                        if mod is not None and hasattr(mod, "parameters"):
-                            for p in mod.parameters():
-                                if p is not None and p.is_cuda:
-                                    try:
-                                        p.data = p.data.to("cpu")
-                                    except Exception:
-                                        pass
-                            for b in mod.buffers():
-                                if b is not None and b.is_cuda:
-                                    try:
-                                        b.data = b.data.to("cpu")
-                                    except Exception:
-                                        pass
-
-                    # 2. Nyahmuat semua modul dorman bukan transformer dari MMGP secara dinamik (Zero Hardcoding)
+                    
+                    # 1. Nyahmuat semua modul dorman bukan transformer dari MMGP secara menyeluruh
                     if active_inst is not None:
                         for mid in list(active_inst.models.keys()):
                             if "transformer" not in str(mid).lower():
@@ -4010,8 +4091,41 @@ try:
                                 if m_entry is not None:
                                     setattr(m_entry, "_pinned_bytes", 0)
 
-                    # 3. Singkirkan bobot modul pembantu & pindahkan embed_tokens ke CPU secara terpilih (Zero Freeze)
+                    # 2. Singkirkan bobot modul pembantu pipeline (text_encoder, visual, vae, dll.)
                     evict_h3_auxiliary_modules(self)
+
+                    # 3. Pindahkan sebarang tensor CUDA modul pembantu ke CPU secara mutlak
+                    te = getattr(self, "text_encoder", None)
+                    if te is not None:
+                        for sub_m in (getattr(te, "language_model", None), getattr(te, "visual", None), te):
+                            if sub_m is not None and hasattr(sub_m, "parameters"):
+                                for p in sub_m.parameters():
+                                    if p is not None and getattr(p, "is_cuda", False):
+                                        try:
+                                            p.data = p.data.to("cpu")
+                                        except Exception:
+                                            pass
+                                for b in sub_m.buffers():
+                                    if b is not None and getattr(b, "is_cuda", False):
+                                        try:
+                                            b.data = b.data.to("cpu")
+                                        except Exception:
+                                            pass
+                    for mod_name in ("video_encoder", "video_decoder", "audio_vae", "vae", "latent_upscaler"):
+                        mod = getattr(self, mod_name, None)
+                        if mod is not None and hasattr(mod, "parameters"):
+                            for p in mod.parameters():
+                                if p is not None and getattr(p, "is_cuda", False):
+                                    try:
+                                        p.data = p.data.to("cpu")
+                                    except Exception:
+                                        pass
+                            for b in mod.buffers():
+                                if b is not None and getattr(b, "is_cuda", False):
+                                    try:
+                                        b.data = b.data.to("cpu")
+                                    except Exception:
+                                        pass
 
                     flush_vram()
                     if torch.cuda.is_available():
@@ -4050,9 +4164,19 @@ try:
                         channel_ratio = 2.0 if is_ref_mode else 1.0
                         retune_active_model_dynamically(active_inst, phase=1, token_scaling_ratio=channel_ratio, is_audio_only=is_audio, height=cur_h, width=cur_w, frame_num=cur_fn)
 
-                    # 7. Laporan Telemetri RAM Masa-Nyata Telus (Ground-Truth Telemetry)
-                    mem = psutil.virtual_memory()
-                    log_debug(f"[MINIMAX H3 LIFECYCLE] Fasa 1 (Encoding) selesai -> Modul pembantu dinyahmuat dari VRAM & mmap dipangkas dari RAM. RAM Hos: {mem.used/(1024**3):.2f} GB / {mem.total/(1024**3):.2f} GB ({mem.percent:.1f}%) | Bebas: {mem.available/(1024**3):.2f} GB. Gelung Denoising sedia berjalan pantas.")
+                    # 7. Verifikasi Empirikal Telus Masa-Nyata (Ground-Truth Empirical Telemetry, Sifar Spekulasi)
+                    if torch.cuda.is_available():
+                        f_bytes, t_bytes = torch.cuda.mem_get_info()
+                        alloc_bytes = torch.cuda.memory_allocated()
+                        res_bytes = torch.cuda.memory_reserved()
+                        mem = psutil.virtual_memory()
+                        log_debug(
+                            f"[MINIMAX H3 LIFECYCLE] Fasa 1 (Encoding) selesai -> Modul pembantu dinyahmuat. "
+                            f"VRAM Alokasi: {alloc_bytes / (1024*1024):.1f}MB | Reserved: {res_bytes / (1024*1024):.1f}MB | "
+                            f"Driver Bebas: {f_bytes / (1024*1024):.1f}MB/{t_bytes / (1024*1024):.1f}MB | "
+                            f"RAM Hos: {mem.used / (1024**3):.2f} GB / {mem.total / (1024**3):.2f} GB ({mem.percent:.1f}%) | "
+                            f"Bebas: {mem.available / (1024**3):.2f} GB. Gelung Denoising sedia berjalan pantas."
+                        )
                 except Exception as ex:
                     log_debug(f"[MINIMAX H3 LIFECYCLE] Ralat pelepasan Fasa 1: {ex}")
 
@@ -4252,48 +4376,13 @@ try:
                         _h3_persistent_kv["key"] = None
                         _h3_persistent_kv["value"] = None
                         _h3_persistent_kv["attn_out"] = None
-                        # Saring dan kumpul SEMUA instans MMGP yang berkaitan (Zero Orphan Offload)
-                        mmgp_targets = set()
-                        act_inst = get_active_mmgp_instance()
-                        if act_inst is not None:
-                            mmgp_targets.add(act_inst)
-                        for attr in ("_shared_offloadobj", "_private_offloadobj", "offloadobj", "_mm_manager"):
-                            cand = getattr(self, attr, None)
-                            if cand is not None and hasattr(cand, "models"):
-                                mmgp_targets.add(cand)
-                        for inst in mmgp_targets:
-                            safe_mmgp_unload(inst, "all")
-
-                        if torch.cuda.is_available():
-                            gc.collect()
+                        clean_fn = globals().get("_universal_deep_clean_memory") or main_module.__dict__.get("_universal_deep_clean_memory")
+                        if clean_fn is not None:
+                            clean_fn("PASCA-PENJANAAN PIPELINE")
+                        else:
+                            evict_h3_auxiliary_modules(self)
                             flush_vram()
-                            try:
-                                _orig_cuda_empty_cache()
-                            except Exception:
-                                pass
-                            try:
-                                torch.cuda.ipc_collect()
-                            except Exception:
-                                pass
-                            try:
-                                torch.cuda.synchronize()
-                            except Exception:
-                                pass
-                        gc.collect()
-                        force_pagefile_push(force_trim=True)
-                        evict_h3_auxiliary_modules(self)
-                        for obj in list(gc.get_objects()):
-                            try:
-                                if torch.is_tensor(obj) and obj.is_cuda:
-                                    obj.data = obj.data.to("cpu")
-                            except Exception:
-                                pass
-                        flush_vram()
-                        trim_current_process_working_set()
-                        if torch.cuda.is_available():
-                            free_post, total_post = torch.cuda.mem_get_info()
-                            alloc_post = torch.cuda.memory_allocated()
-                            log_debug(f"[LIFECYCLE PASCA-PENJANAAN] Penjanaan selesai 100%. VRAM & RAM dipulihkan ke paras dasar: Alokasi={alloc_post/(1024*1024):.1f}MB, DriverBebas={free_post/(1024*1024):.1f}MB/{total_post/(1024*1024):.1f}MB (Zero VRAM Leak, Modul Pembantu di Disk).")
+                            trim_current_process_working_set()
                     except Exception as ex:
                         log_debug(f"[LIFECYCLE PASCA-PENJANAAN] Ralat penyegaran pasca-penjanaan: {ex}")
 
@@ -5383,23 +5472,51 @@ def main():
                             cache_o = getattr(wm, attr)
                             if hasattr(cache_o, "clear"):
                                 cache_o.clear()
-                    for comp_name in ("text_encoder", "vision_encoder", "video_encoder", "vae", "audio_vae", "latent_upscaler"):
-                        comp = getattr(wm, comp_name, None)
-                        if comp is not None:
-                            if comp_name == "text_encoder":
-                                lm = getattr(comp, "language_model", None)
-                                if lm is not None and hasattr(lm, "embed_tokens"):
-                                    et = lm.embed_tokens
-                                    if hasattr(et, "weight") and et.weight is not None and et.weight.is_cuda:
+                    # 1. Pipeline MiniMax H3 Text Encoder (language_model + visual)
+                    te = getattr(wm, "text_encoder", None)
+                    if te is not None:
+                        for sub_m in (getattr(te, "language_model", None), getattr(te, "visual", None), te):
+                            if sub_m is not None and hasattr(sub_m, "parameters"):
+                                for p in sub_m.parameters():
+                                    if p is not None and getattr(p, "is_cuda", False):
                                         try:
-                                            et.to("cpu")
+                                            st = p.untyped_storage()
+                                            if st.is_cuda and st.size() > 0:
+                                                st.resize_(0)
+                                            p.data = torch.empty(0, device="cpu")
                                         except Exception:
                                             pass
-                            elif hasattr(comp, "to"):
-                                try:
-                                    comp.to("cpu")
-                                except Exception:
-                                    pass
+                                for b in sub_m.buffers():
+                                    if b is not None and getattr(b, "is_cuda", False):
+                                        try:
+                                            st = b.untyped_storage()
+                                            if st.is_cuda and st.size() > 0:
+                                                st.resize_(0)
+                                            b.data = torch.empty(0, device="cpu")
+                                        except Exception:
+                                            pass
+                    # 2. Modul-modul lain dalam pipeline
+                    for comp_name in ("transformer", "video_encoder", "video_decoder", "vae", "audio_vae", "latent_upscaler"):
+                        comp = getattr(wm, comp_name, None)
+                        if comp is not None and hasattr(comp, "parameters"):
+                            for p in comp.parameters():
+                                if p is not None and getattr(p, "is_cuda", False):
+                                    try:
+                                        st = p.untyped_storage()
+                                        if st.is_cuda and st.size() > 0:
+                                            st.resize_(0)
+                                        p.data = torch.empty(0, device="cpu")
+                                    except Exception:
+                                        pass
+                            for b in comp.buffers():
+                                if b is not None and getattr(b, "is_cuda", False):
+                                    try:
+                                        st = b.untyped_storage()
+                                        if st.is_cuda and st.size() > 0:
+                                            st.resize_(0)
+                                        b.data = torch.empty(0, device="cpu")
+                                    except Exception:
+                                        pass
             except Exception:
                 pass
 
@@ -5430,7 +5547,18 @@ def main():
             for obj in list(gc.get_objects()):
                 try:
                     if torch.is_tensor(obj) and obj.is_cuda:
-                        obj.data = obj.data.to("cpu")
+                        try:
+                            st = obj.untyped_storage()
+                            if st.is_cuda and st.size() > 0:
+                                st.resize_(0)
+                        except Exception:
+                            pass
+                        obj.data = torch.empty(0, device="cpu")
+                    elif isinstance(obj, torch.storage.UntypedStorage) and obj.is_cuda and obj.size() > 0:
+                        try:
+                            obj.resize_(0)
+                        except Exception:
+                            pass
                 except Exception:
                     pass
             gc.collect()
@@ -5497,11 +5625,26 @@ def main():
             force_pagefile_push(force_trim=True)
             trim_current_process_working_set()
 
-            # E. Pelaporan Telemetri Dinamik Bersih (Sifar Hardcoding)
+            # E. Pelaporan Telemetri Empirikal Tertutup (Closed-Loop Ground-Truth, Sifar Spekulasi)
             if torch.cuda.is_available():
                 f_bytes, t_bytes = torch.cuda.mem_get_info()
                 alloc_bytes = torch.cuda.memory_allocated()
-                print(f"[{phase_label}] VRAM & RAM dibersihkan: Alokasi={alloc_bytes/(1024*1024):.1f}MB | DriverBebas={f_bytes/(1024*1024):.1f}MB/{t_bytes/(1024*1024):.1f}MB (Zero VRAM Leak).")
+                res_bytes = torch.cuda.memory_reserved()
+                mem = psutil.virtual_memory()
+                if alloc_bytes == 0:
+                    print(f"[{phase_label}] VERIFIKASI VRAM BERJAYA: Alokasi CUDA 100% SIFAR (0.0 MB) | Reserved={res_bytes/(1024*1024):.1f}MB | DriverBebas={f_bytes/(1024*1024):.1f}MB/{t_bytes/(1024*1024):.1f}MB | RAM Hos: {mem.used/(1024**3):.2f}GB/{mem.total/(1024**3):.2f}GB ({mem.percent:.1f}%).")
+                else:
+                    live_census = []
+                    for o in gc.get_objects():
+                        try:
+                            if torch.is_tensor(o) and o.is_cuda:
+                                live_census.append(f"{list(o.shape)} {str(o.dtype).replace('torch.', '')} ({o.numel()*o.element_size()/1048576:.1f}MB)")
+                                if len(live_census) >= 5:
+                                    break
+                        except Exception:
+                            pass
+                    census_str = ", ".join(live_census) if live_census else "Storan dalaman PyTorch Caching Allocator"
+                    print(f"[{phase_label}] AMARAN BAKI VRAM: Alokasi={alloc_bytes/(1024*1024):.1f}MB | Tensor hidup: [{census_str}] | DriverBebas={f_bytes/(1024*1024):.1f}MB/{t_bytes/(1024*1024):.1f}MB | RAM Hos: {mem.used/(1024**3):.2f}GB/{mem.total/(1024**3):.2f}GB ({mem.percent:.1f}%).")
         except Exception as e_clean:
             pass
 
