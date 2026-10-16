@@ -327,21 +327,31 @@ class CentralizedUniversalLifecycleManager:
         except Exception:
             pass
 
-        # 2. Kosongkan tensor data secara rekursif
+        # 2. Kosongkan tensor data dan penimbal secara rekursif (termasuk QTensor dan Quanto)
         try:
             if isinstance(module, torch.nn.Module):
-                for p in module.parameters():
-                    if p is not None and hasattr(p, "data") and p.data.numel() > 0:
-                        purged_params += 1
-                        p.data = torch.empty(0, dtype=p.dtype, device='cpu')
-                for b in module.buffers():
-                    if b is not None and hasattr(b, "data") and b.data.numel() > 0:
-                        purged_params += 1
-                        b.data = torch.empty(0, dtype=b.dtype, device='cpu')
+                for m in module.modules():
+                    if hasattr(m, "_parameters"):
+                        for p_name in list(m._parameters.keys()):
+                            p = m._parameters.get(p_name)
+                            if p is not None:
+                                if hasattr(p, "_data") and torch.is_tensor(p._data) and p._data.numel() > 0:
+                                    p._data = torch.empty(0, dtype=p._data.dtype, device='cpu')
+                                if hasattr(p, "_scale") and torch.is_tensor(p._scale) and p._scale.numel() > 0:
+                                    p._scale = torch.empty(0, dtype=p._scale.dtype, device='cpu')
+                                if hasattr(p, "data") and torch.is_tensor(p.data) and p.data.numel() > 0:
+                                    p.data = torch.empty(0, dtype=p.dtype, device='cpu')
+                                purged_params += 1
+                    if hasattr(m, "_buffers"):
+                        for b_name in list(m._buffers.keys()):
+                            b = m._buffers.get(b_name)
+                            if b is not None and hasattr(b, "data") and torch.is_tensor(b.data) and b.data.numel() > 0:
+                                b.data = torch.empty(0, dtype=b.dtype, device='cpu')
+                                purged_params += 1
         except Exception:
             pass
 
-        # 3. Bebaskan cache PyTorch dan MMGP Allocator
+        # 3. Bebaskan cache PyTorch, MMGP Allocator, dan GGUF Index
         try:
             from mmgp.allocator import ram as mmgp_ram
             mmgp_ram.release()
@@ -350,6 +360,13 @@ class CentralizedUniversalLifecycleManager:
         try:
             from shared.cuda_memory import release_ram_cache
             release_ram_cache()
+        except Exception:
+            pass
+        try:
+            from shared.qtypes import gguf as gguf_handler
+            if hasattr(gguf_handler, "_GGUF_LABEL_CACHE"): gguf_handler._GGUF_LABEL_CACHE.clear()
+            if hasattr(gguf_handler, "_GGUF_METADATA_CACHE"): gguf_handler._GGUF_METADATA_CACHE.clear()
+            if hasattr(gguf_handler, "_GGUF_INDEX_CACHE"): gguf_handler._GGUF_INDEX_CACHE.clear()
         except Exception:
             pass
         flush_vram()
@@ -365,6 +382,35 @@ class CentralizedUniversalLifecycleManager:
 
         self.log_telemetry_snapshot("PELUPUSAN MODUL", f"Modul '{module_id}' (100% Sifar Alokasi Terbukti)")
         return purged_params
+
+    def on_model_loaded(self, pipeline, offloadobj=None):
+        """Zero-RAM Startup: Melupuskan Text Encoder dan VAE daripada RAM sebaik sahaja
+        startup/load_models selesai supaya RAM dorman permulaan tidak melonjak ke 30 GB.
+        Text Encoder dimuatkan semula dalam <0.5s apabila penjanaan bermula."""
+        log_debug("[UNIVERSAL LIFECYCLE] Mengaktifkan Zero-RAM Startup Interceptor (Pembersihan Awal Pasca-Muat)...")
+        if pipeline is not None:
+            te = getattr(pipeline, "text_encoder", None)
+            if te is not None:
+                for sub in (getattr(te, "language_model", None), getattr(te, "visual", None), te):
+                    if sub is not None:
+                        self.purge_module_completely(sub, "text_encoder")
+                pipeline.text_encoder = None
+                setattr(pipeline, "_text_encoder_needs_reload", True)
+
+            vae = getattr(pipeline, "video_decoder", None) or getattr(pipeline, "vae", None)
+            if vae is not None:
+                self.purge_module_completely(vae, "vae")
+
+            a_vae = getattr(pipeline, "audio_vae", None)
+            if a_vae is not None:
+                self.purge_module_completely(a_vae, "audio_vae")
+
+            upscaler = getattr(pipeline, "latent_upscaler", None)
+            if upscaler is not None:
+                self.purge_module_completely(upscaler, "latent_upscaler")
+
+        trim_current_process_working_set()
+        self.log_telemetry_snapshot("STARTUP BERSIH", "RAM permulaan kekal minimum sifar pembaziran.")
 
     def transition_to_phase(self, new_phase, pipeline=None, context=None):
         """Pusat Kawalan Peralihan Fasa (Fasa 1: Encode -> Fasa 2: Denoise -> Fasa 3: Decode -> Selesai)."""
@@ -384,11 +430,17 @@ class CentralizedUniversalLifecycleManager:
                             self.purge_module_completely(sub, "text_encoder")
                     pipeline.text_encoder = None
                     setattr(pipeline, "_text_encoder_needs_reload", True)
-                for enc_name in ("vision_encoder", "clip", "video_encoder"):
+                for enc_name in ("vision_encoder", "clip", "video_encoder", "text_encoder"):
                     enc_mod = getattr(pipeline, enc_name, None)
                     if enc_mod is not None:
                         self.purge_module_completely(enc_mod, enc_name)
-            self.log_telemetry_snapshot("FASA 1 TAMAT", "Text Encoder dilupuskan, RAM Lapang untuk Transformer")
+                    act = get_active_mmgp_instance()
+                    if act is not None and hasattr(act, "models") and enc_name in act.models:
+                        try:
+                            act.models.pop(enc_name, None)
+                        except Exception:
+                            pass
+            self.log_telemetry_snapshot("FASA 1 TAMAT", "Text Encoder 100% dilupuskan, RAM Lapang untuk Transformer")
 
         elif new_phase == "PHASE_3_DECODE":
             # Fasa 2 Tamat: Lupus 100% Transformer & KV cache daripada VRAM dan RAM
@@ -3909,7 +3961,10 @@ except Exception as e:
 # ------------------------------------------------------------------------------
 try:
     import models.minimax_h3.transformer as h3_transformer
-    import models.minimax_h3.denoiser_kernels as h3_denoiser_kernels
+    try:
+        from shared.kernels import ops as h3_denoiser_kernels
+    except Exception:
+        h3_denoiser_kernels = None
     
     # Penimbal Statik Adaptif (Zero Allocation Churn untuk Fasa Denoising H3)
     _h3_persistent_kv = {"query": None, "key": None, "value": None, "attn_out": None}
@@ -4283,8 +4338,18 @@ try:
                                 req_seed = kwargs.get("seed", 0)
                                 ckpt_prompt = ckpt.get("prompt", "")
                                 ckpt_time = ckpt.get("timestamp", 0)
-                                is_recent = (time.time() - ckpt_time < 7200) if ckpt_time > 0 else True
-                                is_match = is_recent or (ckpt_prompt and str(ckpt_prompt).strip() == str(req_prompt).strip()) or (ckpt_seed is not None and ckpt_seed == req_seed)
+                                has_new_prompt = bool(req_prompt and ckpt_prompt and str(req_prompt).strip() != str(ckpt_prompt).strip())
+                                has_new_dim = bool(ckpt.get("height") and kwargs.get("height") and ckpt.get("height") != kwargs.get("height")) or \
+                                              bool(ckpt.get("width") and kwargs.get("width") and ckpt.get("width") != kwargs.get("width"))
+                                has_new_seed = bool(req_seed is not None and ckpt.get("seed") is not None and req_seed != 0 and req_seed != ckpt.get("seed"))
+                                has_new_image = bool(kwargs.get("image") is not None or kwargs.get("image2") is not None or kwargs.get("image3") is not None or kwargs.get("ref_video") is not None or kwargs.get("video") is not None)
+
+                                if has_new_prompt or has_new_dim or has_new_seed or has_new_image:
+                                    is_match = False
+                                    log_debug("[KONTINUUM PEMULIHAN] Arahan/input/seed baharu dikesan berbeza. Checkpoint laten lama diabaikan untuk penjanaan baharu tulen.")
+                                else:
+                                    is_match = bool(ckpt_prompt and str(ckpt_prompt).strip() == str(req_prompt).strip()) and \
+                                               bool(ckpt.get("seed") is not None and ckpt.get("seed") == req_seed)
                                 if is_match and saved_v is not None and torch.is_tensor(saved_v):
                                     log_debug("[KONTINUUM PEMULIHAN AKTIF] Dikesan checkpoint laten video siap didenoise di SSD!")
                                     log_debug("[KONTINUUM PEMULIHAN] Melangkau ~16 minit proses denoising dan terus menyambung ke fasa VAE Decode...")
@@ -4408,7 +4473,7 @@ try:
                 _generation_state["active_hidden_dim"] = getattr(self.out_proj, "out_features", 0) or getattr(self, "hidden_size", 0)
                 _generation_state["active_elem_size"] = x.element_size()
                 use_sol = not hasattr(self, "vdn") and self.sol_attention is not None and self.sol_attention.use_for_layer(seq_len)
-                fused_rms = rope is not None and not use_sol and not hasattr(self, "vdn") and h3_denoiser_kernels.can_rms(x, packed_rope, self.q_norm, self.k_norm)
+                fused_rms = rope is not None and not use_sol and not hasattr(self, "vdn") and hasattr(h3_denoiser_kernels, "can_rms") and h3_denoiser_kernels.can_rms(x, packed_rope, self.q_norm, self.k_norm)
                 split_qkv = hasattr(self, "q_proj")
 
                 # ZERO HARDCODING: Sensor Adaptif Dinamik Masa-Nyata (Sifar Had Siling Kaku / Zero Hardcoded Cap)
@@ -4671,8 +4736,11 @@ try:
 
                 # 4. Out-Projection (Gated Linear Residual):
                 if residual is not None:
-                    from models.minimax_h3 import denoiser_kernels
-                    res_linear = denoiser_kernels.gated_linear(self.out_proj, output, residual, gate, segments)
+                    try:
+                        from shared.kernels import ops as denoiser_kernels
+                        res_linear = denoiser_kernels.gated_linear(self.out_proj, output, residual, gate, segments)
+                    except Exception:
+                        res_linear = None
                     del output
                     if do_prof and torch.cuda.is_available():
                         torch.cuda.synchronize()
@@ -4958,7 +5026,7 @@ try:
         # 3. Attention
         t0 = time.perf_counter()
         if (not residual_signature_elements and not hasattr(self.attn, 'vdn')
-                and h3_denoiser_kernels.can_linear(self.attn.out_proj, residual_list[0])
+                and hasattr(h3_denoiser_kernels, "can_linear") and h3_denoiser_kernels.can_linear(self.attn.out_proj, residual_list[0])
                 and h3_denoiser_kernels.can_linear(self.mlp.fc2, residual_list[0])):
             hidden = self.attn(h_list, rope=rope, residual=residual_list[0], gate=gate_msa, segments=segments)
             if torch.cuda.is_available():
@@ -5808,6 +5876,16 @@ def main():
     if target_enhancer in patched_code:
         patched_code = patched_code.replace(target_enhancer, replacement_enhancer, 1)
         log_debug("Perisai Gradio NoneType Guard (refresh_prompt_enhancer_labels) berjaya disuntik.")
+
+    # Suntikan 5: Perisai Sejagat Zero-RAM Startup (Pembersihan Awal Pasca-Muat wgp.py load_models)
+    if "return wan_model, offloadobj" in patched_code:
+        patched_code = re.sub(
+            r"([ \t]+)return wan_model, offloadobj[ \t]*",
+            r"\1try:\n\1    CentralizedUniversalLifecycleManager.get_instance().on_model_loaded(wan_model, offloadobj)\n\1except Exception as _mgr_err:\n\1    pass\n\1return wan_model, offloadobj",
+            patched_code,
+            count=1
+        )
+        log_debug("Perisai Sejagat Zero-RAM Startup (Pembersihan Awal Pasca-Muat) berjaya disuntik ke wgp.py!")
 
     # Jalankan wgp.py dalam konteks __main__
     exec(patched_code, main_module.__dict__)
