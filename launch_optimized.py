@@ -4282,10 +4282,9 @@ try:
                                 req_prompt = kwargs.get("input_prompt") or (args[0] if len(args) > 0 else "")
                                 req_seed = kwargs.get("seed", 0)
                                 ckpt_prompt = ckpt.get("prompt", "")
-                                ckpt_seed = ckpt.get("seed", -1)
-                                is_match = (str(ckpt_prompt).strip() == str(req_prompt).strip()) or (ckpt_seed == req_seed) or (
-                                    ckpt.get("height") == kwargs.get("height") and ckpt.get("width") == kwargs.get("width")
-                                )
+                                ckpt_time = ckpt.get("timestamp", 0)
+                                is_recent = (time.time() - ckpt_time < 7200) if ckpt_time > 0 else True
+                                is_match = is_recent or (ckpt_prompt and str(ckpt_prompt).strip() == str(req_prompt).strip()) or (ckpt_seed is not None and ckpt_seed == req_seed)
                                 if is_match and saved_v is not None and torch.is_tensor(saved_v):
                                     log_debug("[KONTINUUM PEMULIHAN AKTIF] Dikesan checkpoint laten video siap didenoise di SSD!")
                                     log_debug("[KONTINUUM PEMULIHAN] Melangkau ~16 minit proses denoising dan terus menyambung ke fasa VAE Decode...")
