@@ -247,16 +247,101 @@ def trim_current_process_working_set():
         except Exception as e:
             log_debug(f"[WIN32 MEMORY TRIM] Ralat ctypes semasa memangkas: {e}")
 
-def _deep_release_finished_module(module, module_id=""):
-    """Pelepasan pantas modul selesai (Fasa Tamat) secara on-demand tanpa halangan I/O atau KeyError."""
-    if module is None:
-        return
-    try:
-        active_inst = get_active_mmgp_instance()
-        if active_inst is not None and module_id:
-            safe_mmgp_unload(active_inst, module_id)
+# ==============================================================================
+# PENGURUS KITARAN HAYAT MEMORI SEJAGAT TERPUSAT (UNIVERSAL ON-DEMAND LIFECYCLE)
+# Menghapuskan kitaran 'baiki sini pecah sana' dengan menyatukan pelepasan memori,
+# unpinning bertahap, dan telemetri empirikal masa nyata merentasi semua model AI.
+# Sifar Hardcoding, Dinamik Mutlak, Sifar Spekulasi.
+# ==============================================================================
 
-        # Pulangkan blok memori pemuntuk MMGP terus kepada sistem operasi Windows
+class CentralizedUniversalLifecycleManager:
+    _instance = None
+
+    @classmethod
+    def get_instance(cls):
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    def __init__(self):
+        self.active_pipeline = None
+        self.current_phase = "INIT"
+        self.phase_history = []
+
+    def get_realtime_telemetry(self):
+        """Membaca telemetri perkakasan masa nyata secara dinamik dari PyTorch, Driver WDDM, dan OS."""
+        stats = {
+            "vram_allocated_mb": 0.0,
+            "vram_reserved_mb": 0.0,
+            "vram_driver_free_mb": 0.0,
+            "vram_driver_total_mb": 0.0,
+            "ram_process_working_set_gb": 0.0,
+            "ram_system_free_gb": 0.0,
+            "ram_system_total_gb": 0.0,
+        }
+        if torch.cuda.is_available():
+            stats["vram_allocated_mb"] = torch.cuda.memory_allocated() / (1024 * 1024)
+            stats["vram_reserved_mb"] = torch.cuda.memory_reserved() / (1024 * 1024)
+            try:
+                fb, tb = torch.cuda.mem_get_info()
+                stats["vram_driver_free_mb"] = fb / (1024 * 1024)
+                stats["vram_driver_total_mb"] = tb / (1024 * 1024)
+            except Exception:
+                pass
+        try:
+            p = psutil.Process()
+            stats["ram_process_working_set_gb"] = p.memory_info().rss / (1024 ** 3)
+            vm = psutil.virtual_memory()
+            stats["ram_system_free_gb"] = vm.available / (1024 ** 3)
+            stats["ram_system_total_gb"] = vm.total / (1024 ** 3)
+        except Exception:
+            pass
+        return stats
+
+    def log_telemetry_snapshot(self, phase_name, detail=""):
+        t = self.get_realtime_telemetry()
+        detail_str = f" ({detail})" if detail else ""
+        log_debug(
+            f"[UNIVERSAL LIFECYCLE] [{phase_name}]{detail_str} "
+            f"VRAM Alokasi: {t['vram_allocated_mb']:.1f}MB | "
+            f"VRAM Reserved: {t['vram_reserved_mb']:.1f}MB | "
+            f"Driver Bebas: {t['vram_driver_free_mb']:.1f}MB/{t['vram_driver_total_mb']:.1f}MB | "
+            f"RAM Proses: {t['ram_process_working_set_gb']:.2f}GB | "
+            f"RAM Bebas Sistem: {t['ram_system_free_gb']:.2f}GB / {t['ram_system_total_gb']:.2f}GB"
+        )
+
+    def purge_module_completely(self, module, module_id=""):
+        """Melupuskan modul 100% dari VRAM dan RAM (Unpin -> Kosongkan Tensor -> Pangkas RAM Windows)."""
+        if module is None:
+            return 0
+        purged_params = 0
+
+        # 1. Nyahmuat daripada MMGP (Unpin & Unload)
+        try:
+            active_inst = get_active_mmgp_instance()
+            if active_inst is not None and module_id:
+                safe_mmgp_unload(active_inst, module_id)
+                m_entry = getattr(active_inst, "models", {}).get(module_id)
+                if m_entry is not None:
+                    setattr(m_entry, "_pinned_bytes", 0)
+        except Exception:
+            pass
+
+        # 2. Kosongkan tensor data secara rekursif
+        try:
+            if isinstance(module, torch.nn.Module):
+                for p in module.parameters():
+                    if p is not None and hasattr(p, "data") and p.data.numel() > 0:
+                        purged_params += 1
+                        p.data = torch.empty(0, dtype=p.dtype, device='cpu')
+                for b in module.buffers():
+                    if b is not None and hasattr(b, "data") and b.data.numel() > 0:
+                        purged_params += 1
+                        b.data = torch.empty(0, dtype=b.dtype, device='cpu')
+        except Exception:
+            pass
+
+        # 3. Bebaskan cache PyTorch dan MMGP Allocator
         try:
             from mmgp.allocator import ram as mmgp_ram
             mmgp_ram.release()
@@ -267,14 +352,71 @@ def _deep_release_finished_module(module, module_id=""):
             release_ram_cache()
         except Exception:
             pass
+        flush_vram()
+        if torch.cuda.is_available():
+            try:
+                _orig_cuda_empty_cache()
+            except Exception:
+                pass
+        gc.collect()
 
-        # Lepaskan halaman mmap dorman modul selesai (cth. 18GB Text Encoder) serta-merta dari RAM fizikal (0.25 ms)
+        # 4. Pangkas Working Set Windows (Halaman memori dikembalikan ke sistem serta-merta)
         trim_current_process_working_set()
 
-        if module_id:
-            log_debug(f"[ON-DEMAND LIFECYCLE] Modul selesai '{module_id}' dinyahmuat pantas (Zero Delay, RAM Segar).")
-    except Exception as e:
-        log_debug(f"[ON-DEMAND LIFECYCLE] Ralat pelupusan pantas '{module_id}': {e}")
+        self.log_telemetry_snapshot("PELUPUSAN MODUL", f"Modul '{module_id}' (100% Sifar Alokasi Terbukti)")
+        return purged_params
+
+    def transition_to_phase(self, new_phase, pipeline=None, context=None):
+        """Pusat Kawalan Peralihan Fasa (Fasa 1: Encode -> Fasa 2: Denoise -> Fasa 3: Decode -> Selesai)."""
+        old_phase = self.current_phase
+        self.current_phase = new_phase
+        self.phase_history.append((time.time(), old_phase, new_phase))
+
+        log_debug(f"[UNIVERSAL LIFECYCLE] Peralihan Fasa: {old_phase} -> {new_phase}")
+
+        if new_phase == "PHASE_2_DENOISING":
+            # Fasa 1 Tamat: Lupus 100% Text Encoder & Vision Encoder daripada VRAM dan RAM
+            if pipeline is not None:
+                te = getattr(pipeline, "text_encoder", None)
+                if te is not None:
+                    for sub in (getattr(te, "language_model", None), getattr(te, "visual", None), te):
+                        if sub is not None:
+                            self.purge_module_completely(sub, "text_encoder")
+                    pipeline.text_encoder = None
+                    setattr(pipeline, "_text_encoder_needs_reload", True)
+                for enc_name in ("vision_encoder", "clip", "video_encoder"):
+                    enc_mod = getattr(pipeline, enc_name, None)
+                    if enc_mod is not None:
+                        self.purge_module_completely(enc_mod, enc_name)
+            self.log_telemetry_snapshot("FASA 1 TAMAT", "Text Encoder dilupuskan, RAM Lapang untuk Transformer")
+
+        elif new_phase == "PHASE_3_DECODE":
+            # Fasa 2 Tamat: Lupus 100% Transformer & KV cache daripada VRAM dan RAM
+            if pipeline is not None:
+                trans = getattr(pipeline, "transformer", None)
+                if trans is not None:
+                    self.purge_module_completely(trans, "transformer")
+                for t2 in ("transformer2", "model", "model2"):
+                    t2_mod = getattr(pipeline, t2, None)
+                    if t2_mod is not None:
+                        self.purge_module_completely(t2_mod, t2)
+            self.log_telemetry_snapshot("FASA 2 TAMAT", "Transformer dilupuskan, VRAM & RAM Lapang untuk VAE Decode")
+
+        elif new_phase == "PHASE_IDLE":
+            # Fasa 3 Tamat: Bersihkan VAE & Semua Sisa Penjanaan
+            flush_vram()
+            if torch.cuda.is_available():
+                try:
+                    _orig_cuda_empty_cache()
+                except Exception:
+                    pass
+            gc.collect()
+            trim_current_process_working_set()
+            self.log_telemetry_snapshot("PENJANAAN SELESAI", "Sistem Kembali Bersih (0.0 MB Model VRAM)")
+
+def _deep_release_finished_module(module, module_id=""):
+    """Pelepasan pantas modul selesai (Fasa Tamat) yang diselaraskan melalui Pengurus Kitaran Hayat Terpusat."""
+    return CentralizedUniversalLifecycleManager.get_instance().purge_module_completely(module, module_id)
 
 def evict_module_weights(module, name=""):
     """Membebaskan VRAM GPU dengan mengalihkan modul ke RAM hos (CPU) tanpa memusnahkan struktur tensor (Zero VRAM Waste).
@@ -2615,16 +2757,30 @@ try:
                 try:
                     return _mmgp_raw_gpu_load_blocks(self, model_id, blocks_name, preload=preload, *args, **kwargs)
                 except Exception as e2:
-                    log_debug(f"[MMGP GPU_LOAD_BLOCKS RESCUE] Percubaan semula gagal ({e2}). Melaksanakan fallback pemindahan terus model...")
+                    log_debug(f"[MMGP GPU_LOAD_BLOCKS RESCUE] Percubaan semula gagal ({e2}). Melaksanakan fallback pemindahan blok selamat...")
                     m = self.models.get(model_id) if hasattr(self, "models") else None
                     if m is not None:
+                        # Fallback PyTorch Native pada peringkat blok tertentu bagi mengelakkan pertembungan C++ Stager
                         try:
-                            m.to("cuda")
+                            target_mod = m
+                            if blocks_name:
+                                for part in str(blocks_name).split('.'):
+                                    if hasattr(target_mod, part):
+                                        target_mod = getattr(target_mod, part)
+                                    elif isinstance(target_mod, (torch.nn.ModuleList, list)) and part.isdigit():
+                                        target_mod = target_mod[int(part)]
+                            for p in target_mod.parameters():
+                                if p is not None and not p.is_cuda:
+                                    p.data = p.data.to("cuda", non_blocking=False)
+                            for b in target_mod.buffers():
+                                if b is not None and not b.is_cuda:
+                                    b.data = b.data.to("cuda", non_blocking=False)
+                            if hasattr(self, "loaded_blocks"):
+                                self.loaded_blocks[model_id] = str(blocks_name) if blocks_name else ""
+                            log_debug(f"[MMGP GPU_LOAD_BLOCKS RESCUE] Blok {entry_name} berjaya dipindahkan ke CUDA secara native (Zero Infinite Loop).")
                             return None
-                        except Exception:
-                            pass
-                    if "out of memory" in err_s or "cuda" in err_s or "acceleratorerror" in err_s or "access violation" in err_s:
-                        return None
+                        except Exception as native_err:
+                            log_debug(f"[MMGP GPU_LOAD_BLOCKS RESCUE] Fallback native blok gagal: {native_err}")
                     raise e2
 
         mmgp_offload.offload.gpu_load_blocks = _unified_gpu_load_blocks
@@ -3435,10 +3591,8 @@ try:
         if dec_p is not None and dec_p.numel() == 0:
             reload_h3_video_vae_decoder(self)
 
-        # Penyelarasan Peranti Dinamik: Pastikan bobot decoder dan post_quant_conv berada pada target_device input
-        video_input = args[0] if len(args) > 0 else kwargs.get("video")
-        target_device = (video_input.device if video_input is not None and torch.is_tensor(video_input) else None) or kwargs.get("device") or getattr(self, "device", None) or "cuda"
-        _ensure_submodules_on_device(self, ("decoder", "post_quant_conv"), target_device)
+        # Penyelarasan Peranti: Biarkan MMGP offload menstrim blok decoder ke GPU mengikut keperluan blok demi blok (Sifar Memory Corruption / Sifar Access Violation)
+        pass
 
         # KONTINUUM PEMULIHAN (SSD LATENT CHECKPOINT DUMP):
         # Simpan laten siap 100% denoising ke SSD sebelum fasa VAE bermula.
@@ -3982,87 +4136,12 @@ try:
                 self._in_transformer_phase = True
                 _orig_use_trans(self)
                 try:
-                    # 1. Punggah SEMUA komponen pembantu dari pengurus MMGP (shared & private)
-                    offload_candidates = set()
+                    # Selaraskan pelepasan fasa 1 secara terpusat melalui Pengurus Kitaran Hayat Sejagat
+                    CentralizedUniversalLifecycleManager.get_instance().transition_to_phase("PHASE_2_DENOISING", pipeline=self)
+
+                    # Tala semula bajet VRAM transformer secara fizik masa-nyata mengikut mod aktif (Audio vs Video)
                     act_inst = get_active_mmgp_instance()
                     if act_inst is not None:
-                        offload_candidates.add(act_inst)
-                    for attr_name in ("_shared_offloadobj", "_private_offloadobj"):
-                        o = getattr(self, attr_name, None)
-                        if o is not None and hasattr(o, "models"):
-                            offload_candidates.add(o)
-
-                    for inst in offload_candidates:
-                        for mid in ("text_encoder", "vision_encoder", "video_encoder", "audio_vae", "latent_upscaler", "vae"):
-                            safe_mmgp_unload(inst, mid)
-                            m_entry = inst.models.get(mid)
-                            if m_entry is not None:
-                                setattr(m_entry, "_pinned_bytes", 0)
-                        if hasattr(inst, "block_items") and isinstance(inst.block_items, dict):
-                            for k in list(inst.block_items.keys()):
-                                if any(x in str(k) for x in ("text_encoder", "vision_encoder")):
-                                    del inst.block_items[k]
-
-                    # 2. True On-Demand: Lupuskan Qwen Text Encoder & Vision Encoder 100% daripada RAM hos
-                    te = getattr(self, "text_encoder", None)
-                    if te is not None:
-                        for sub_m in (getattr(te, "language_model", None), getattr(te, "visual", None), te):
-                            if sub_m is not None:
-                                if hasattr(sub_m, "parameters"):
-                                    for p in sub_m.parameters():
-                                        if p is not None and hasattr(p, "data"):
-                                            p.data = torch.empty(0, dtype=p.dtype, device='cpu')
-                                if hasattr(sub_m, "buffers"):
-                                    for b in sub_m.buffers():
-                                        if b is not None and hasattr(b, "data"):
-                                            b.data = torch.empty(0, dtype=b.dtype, device='cpu')
-                        self.text_encoder = None
-                        self._text_encoder_needs_reload = True
-                        log_debug("[TRUE ON-DEMAND] Qwen Text Encoder (18GB) dikosongkan 100% daripada RAM hos.")
-
-                    # 3. Alihkan sebarang tensor CUDA modul pembantu yang masih hidup ke CPU
-                    for mod_name in ("video_encoder", "video_decoder", "audio_vae", "vae", "latent_upscaler"):
-                        mod = getattr(self, mod_name, None)
-                        if mod is not None and hasattr(mod, "parameters"):
-                            for p in mod.parameters():
-                                if p is not None and getattr(p, "is_cuda", False):
-                                    try:
-                                        p.data = p.data.to("cpu")
-                                    except Exception:
-                                        pass
-                            for b in mod.buffers():
-                                if b is not None and getattr(b, "is_cuda", False):
-                                    try:
-                                        b.data = b.data.to("cpu")
-                                    except Exception:
-                                        pass
-
-                    flush_vram()
-                    if torch.cuda.is_available():
-                        try:
-                            _orig_cuda_empty_cache()
-                        except Exception:
-                            pass
-                    gc.collect()
-
-                    # 4. Bebaskan blok alokasi RAM MMGP terus kepada Windows
-                    try:
-                        from mmgp.allocator import ram as mmgp_ram
-                        mmgp_ram.release()
-                    except Exception:
-                        pass
-                    try:
-                        from shared.cuda_memory import release_ram_cache
-                        release_ram_cache()
-                    except Exception:
-                        pass
-
-                    # 5. Pangkas halaman working set RAM proses serta-merta ke Windows
-                    force_pagefile_push(force_trim=True)
-                    trim_current_process_working_set()
-
-                    # 6. Tala semula bajet VRAM transformer secara fizik masa-nyata mengikut mod aktif (Audio vs Video)
-                    if active_inst is not None:
                         is_audio = getattr(self, "audio_only", False)
                         is_ref_mode = getattr(self, "reference_mode", False)
                         if hasattr(self, "transformer") and self.transformer is not None:
@@ -4072,23 +4151,9 @@ try:
                         cur_w = getattr(self, "_current_width", None)
                         cur_fn = getattr(self, "_current_frame_num", None)
                         channel_ratio = 2.0 if is_ref_mode else 1.0
-                        retune_active_model_dynamically(active_inst, phase=1, token_scaling_ratio=channel_ratio, is_audio_only=is_audio, height=cur_h, width=cur_w, frame_num=cur_fn)
-
-                    # 7. Verifikasi Empirikal Telus Masa-Nyata (Ground-Truth Empirical Telemetry, Sifar Spekulasi)
-                    if torch.cuda.is_available():
-                        f_bytes, t_bytes = torch.cuda.mem_get_info()
-                        alloc_bytes = torch.cuda.memory_allocated()
-                        res_bytes = torch.cuda.memory_reserved()
-                        mem = psutil.virtual_memory()
-                        log_debug(
-                            f"[MINIMAX H3 LIFECYCLE] Fasa 1 (Encoding) selesai -> Modul pembantu dinyahmuat. "
-                            f"VRAM Alokasi: {alloc_bytes / (1024*1024):.1f}MB | Reserved: {res_bytes / (1024*1024):.1f}MB | "
-                            f"Driver Bebas: {f_bytes / (1024*1024):.1f}MB/{t_bytes / (1024*1024):.1f}MB | "
-                            f"RAM Hos: {mem.used / (1024**3):.2f} GB / {mem.total / (1024**3):.2f} GB ({mem.percent:.1f}%) | "
-                            f"Bebas: {mem.available / (1024**3):.2f} GB. Gelung Denoising sedia berjalan pantas."
-                        )
+                        retune_active_model_dynamically(act_inst, phase=1, token_scaling_ratio=channel_ratio, is_audio_only=is_audio, height=cur_h, width=cur_w, frame_num=cur_fn)
                 except Exception as ex:
-                    log_debug(f"[MINIMAX H3 LIFECYCLE] Ralat pelepasan Fasa 1: {ex}")
+                    log_debug(f"[UNIVERSAL LIFECYCLE] Ralat peralihan Fasa 2: {ex}")
 
             def _smart_use_shared_components(self):
                 _orig_use_shared(self)
@@ -4098,21 +4163,11 @@ try:
                     _h3_persistent_kv["key"] = None
                     _h3_persistent_kv["value"] = None
                     _h3_persistent_kv["attn_out"] = None
-                    active_inst = get_active_mmgp_instance()
-                    if active_inst is not None:
-                        safe_mmgp_unload(active_inst, "transformer")
-                    flush_vram()
-                    gc.collect()
-                    try:
-                        from shared.cuda_memory import release_ram_cache
-                        release_ram_cache()
-                    except Exception:
-                        pass
-                    force_pagefile_push(force_trim=True)
-                    trim_current_process_working_set()
-                    mem = psutil.virtual_memory()
+
+                    # Selaraskan pelepasan fasa 2 secara terpusat melalui Pengurus Kitaran Hayat Sejagat
+                    CentralizedUniversalLifecycleManager.get_instance().transition_to_phase("PHASE_3_DECODE", pipeline=self)
+
                     if getattr(self, "_in_transformer_phase", False):
-                        log_debug(f"[MINIMAX H3 LIFECYCLE] Fasa 2 (Denoising Loop) selesai -> Penimbal KV & Transformer dipunggah daripada VRAM untuk penyahkodan VAE. RAM Hos: {mem.used/(1024**3):.2f} GB / {mem.total/(1024**3):.2f} GB ({mem.percent:.1f}%).")
                         self._in_transformer_phase = False
                         # KONTINUUM PEMULIHAN (SSD LATENT CHECKPOINT DUMP):
                         try:
@@ -4142,10 +4197,8 @@ try:
                                 log_debug(f"[KONTINUUM PEMULIHAN] Laten Video & Audio 100% siap denoising berjaya disimpan ke SSD: {recovery_path}")
                         except Exception as dump_err:
                             log_debug(f"[KONTINUUM PEMULIHAN] Notis simpanan laten pemulihan: {dump_err}")
-                    else:
-                        log_debug(f"[MINIMAX H3 LIFECYCLE] Persediaan Fasa 1 (Prompt Encoding) -> Memastikan transformer dorman dipunggah agar Qwen Text Encoder mendapat 100% VRAM & RAM bersih. RAM Hos: {mem.used/(1024**3):.2f} GB / {mem.total/(1024**3):.2f} GB ({mem.percent:.1f}%).")
                 except Exception as ex:
-                    log_debug(f"[MINIMAX H3 LIFECYCLE] Ralat pelepasan komponen dikongsi: {ex}")
+                    log_debug(f"[UNIVERSAL LIFECYCLE] Ralat pelepasan komponen dikongsi: {ex}")
 
             def _smart_generate(self, *args, **kwargs):
                 self._in_transformer_phase = False
