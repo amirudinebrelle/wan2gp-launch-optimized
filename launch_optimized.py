@@ -1011,7 +1011,51 @@ try:
                 raise err
                 
         s_gguf.GGUFWeightTensor.dequantize = _safe_gguf_dequantize
-        log_debug("Perisai GGUF Universal Dynamic Memory Footprint Interceptor berjaya dipasang.")
+
+        # Perisai Sejagat Resilient GGUF Kernel (Penyelamat Automatik GGML Assertion & Kernel Abort)
+        # Menyelesaikan ralat 'RuntimeError: ggml abort ... GGML_ASSERT(ne % blck == 0) failed'
+        # semasa pemprosesan token visual Qwen3-VL atau bentuk matriks ganjil.
+        if hasattr(s_gguf, "_try_llamacpp_cuda_linear"):
+            _orig_try_llamacpp_linear = s_gguf._try_llamacpp_cuda_linear
+            @functools.wraps(_orig_try_llamacpp_linear)
+            def _safe_try_llamacpp_linear(weight_tensor, input_tensor, bias, target_dtype):
+                try:
+                    return _orig_try_llamacpp_linear(weight_tensor, input_tensor, bias, target_dtype)
+                except Exception as e_kernel:
+                    log_debug(f"[GGUF RESCUE] Kernel CUDA linear llama.cpp terhalang ({e_kernel}). Mengalirkan ke fallback PyTorch ATen...")
+                    return None
+            s_gguf._try_llamacpp_cuda_linear = _safe_try_llamacpp_linear
+
+        if hasattr(s_gguf, "_try_llamacpp_cuda_embedding"):
+            _orig_try_llamacpp_emb = s_gguf._try_llamacpp_cuda_embedding
+            @functools.wraps(_orig_try_llamacpp_emb)
+            def _safe_try_llamacpp_emb(weight_tensor, index_tensor, target_dtype):
+                try:
+                    return _orig_try_llamacpp_emb(weight_tensor, index_tensor, target_dtype)
+                except Exception as e_kernel:
+                    log_debug(f"[GGUF RESCUE] Kernel CUDA embedding llama.cpp terhalang ({e_kernel}). Mengalirkan ke fallback PyTorch ATen...")
+                    return None
+            s_gguf._try_llamacpp_cuda_embedding = _safe_try_llamacpp_emb
+
+        if hasattr(s_gguf, "GGUFWeightTensor") and hasattr(s_gguf.GGUFWeightTensor, "linear"):
+            _orig_gguf_weight_linear = s_gguf.GGUFWeightTensor.linear
+            @functools.wraps(_orig_gguf_weight_linear)
+            def _safe_gguf_weight_linear(self, input, bias=None):
+                try:
+                    return _orig_gguf_weight_linear(self, input, bias=bias)
+                except Exception as e_lin:
+                    log_debug(f"[GGUF WEIGHT RESCUE] Ralat linear GGUF ({e_lin}). Mengaktifkan fallback dense PyTorch native...")
+                    target_dev = self.device if hasattr(self, "device") else (input.device if torch.is_tensor(input) else "cuda")
+                    target_dtype = self.dtype if hasattr(self, "dtype") else torch.bfloat16
+                    w = self.dequantize(dtype=target_dtype, device=target_dev)
+                    if torch.is_tensor(input) and input.dtype != w.dtype:
+                        input = input.to(w.dtype)
+                    if bias is not None and torch.is_tensor(bias) and bias.dtype != w.dtype:
+                        bias = bias.to(w.dtype)
+                    return torch.nn.functional.linear(input, w, bias)
+            s_gguf.GGUFWeightTensor.linear = _safe_gguf_weight_linear
+
+        log_debug("Perisai GGUF Universal Dynamic Memory Footprint & Resilient Kernel Interceptor berjaya dipasang.")
 except Exception as e:
     log_debug(f"Pintasan modul GGUF gagal: {e}")
 
