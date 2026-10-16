@@ -1247,6 +1247,73 @@ torch.nn.functional.conv3d = _resilient_conv3d
 torch.nn.functional.conv2d = _resilient_conv2d
 log_debug("Perisai Sejagat Resilient Conv3D & Conv2D (cuDNN Blackwell Engine Fallback & Universal Device Harmonizer Guard) berjaya dipasang.")
 
+# ==========================================================================
+# Perisai Sejagat LayerNorm & GroupNorm (Universal Device/Dtype Harmonizer)
+# Menyelesaikan sebarang 'Expected all tensors to be on the same device'
+# ==========================================================================
+_orig_layer_norm = torch.nn.functional.layer_norm
+_orig_group_norm = torch.nn.functional.group_norm
+
+@functools.wraps(_orig_layer_norm)
+def _safe_layer_norm(input, normalized_shape, weight=None, bias=None, eps=1e-5):
+    if torch.is_tensor(input):
+        target_dev = input.device
+        target_dt = input.dtype
+        if weight is not None and torch.is_tensor(weight) and (weight.device != target_dev or weight.dtype != target_dt):
+            try:
+                weight = weight.to(device=target_dev, dtype=target_dt)
+            except Exception:
+                pass
+        if bias is not None and torch.is_tensor(bias) and (bias.device != target_dev or bias.dtype != target_dt):
+            try:
+                bias = bias.to(device=target_dev, dtype=target_dt)
+            except Exception:
+                pass
+    try:
+        return _orig_layer_norm(input, normalized_shape, weight=weight, bias=bias, eps=eps)
+    except Exception as norm_err:
+        err_s = str(norm_err).lower()
+        if "device" in err_s or "dtype" in err_s or "type" in err_s or "same" in err_s:
+            log_debug(f"[LAYERNORM RESCUE] Menyelaras peranti LayerNorm: {norm_err}...")
+            target_dev = input.device if torch.is_tensor(input) else torch.device("cuda")
+            target_dt = input.dtype if torch.is_tensor(input) else torch.bfloat16
+            w = weight.to(device=target_dev, dtype=target_dt) if (weight is not None and torch.is_tensor(weight)) else weight
+            b = bias.to(device=target_dev, dtype=target_dt) if (bias is not None and torch.is_tensor(bias)) else bias
+            return _orig_layer_norm(input, normalized_shape, weight=w, bias=b, eps=eps)
+        raise norm_err
+
+@functools.wraps(_orig_group_norm)
+def _safe_group_norm(input, num_groups, weight=None, bias=None, eps=1e-5):
+    if torch.is_tensor(input):
+        target_dev = input.device
+        target_dt = input.dtype
+        if weight is not None and torch.is_tensor(weight) and (weight.device != target_dev or weight.dtype != target_dt):
+            try:
+                weight = weight.to(device=target_dev, dtype=target_dt)
+            except Exception:
+                pass
+        if bias is not None and torch.is_tensor(bias) and (bias.device != target_dev or bias.dtype != target_dt):
+            try:
+                bias = bias.to(device=target_dev, dtype=target_dt)
+            except Exception:
+                pass
+    try:
+        return _orig_group_norm(input, num_groups, weight=weight, bias=bias, eps=eps)
+    except Exception as gnorm_err:
+        err_s = str(gnorm_err).lower()
+        if "device" in err_s or "dtype" in err_s or "type" in err_s or "same" in err_s:
+            log_debug(f"[GROUPNORM RESCUE] Menyelaras peranti GroupNorm: {gnorm_err}...")
+            target_dev = input.device if torch.is_tensor(input) else torch.device("cuda")
+            target_dt = input.dtype if torch.is_tensor(input) else torch.bfloat16
+            w = weight.to(device=target_dev, dtype=target_dt) if (weight is not None and torch.is_tensor(weight)) else weight
+            b = bias.to(device=target_dev, dtype=target_dt) if (bias is not None and torch.is_tensor(bias)) else bias
+            return _orig_group_norm(input, num_groups, weight=w, bias=b, eps=eps)
+        raise gnorm_err
+
+torch.nn.functional.layer_norm = _safe_layer_norm
+torch.nn.functional.group_norm = _safe_group_norm
+log_debug("Perisai Sejagat LayerNorm & GroupNorm (Universal Device/Dtype Harmonizer Guard) berjaya dipasang.")
+
 # Pintasan GGUF Proaktif Sejagat: Menapis Berdasarkan Nisbah Lonjakan Memori Fizikal Masa-Nyata
 try:
     import shared.qtypes.gguf as s_gguf
@@ -3688,8 +3755,22 @@ try:
             upsampling = getattr(vae, "upsampling", False)
             new_vae = h3_main._load_video_vae(fn, qkv_splitting=bool(split_map), upsampling=upsampling)
             if hasattr(new_vae, "decoder") and new_vae.decoder is not None:
+                if hasattr(vae, "decoder") and vae.decoder is not None:
+                    new_params = dict(new_vae.decoder.named_parameters())
+                    for p_name, p in vae.decoder.named_parameters():
+                        if p_name in new_params:
+                            p.data = new_params[p_name].data.clone()
+                    new_bufs = dict(new_vae.decoder.named_buffers())
+                    for b_name, b in vae.decoder.named_buffers():
+                        if b_name in new_bufs:
+                            b.data = new_bufs[b_name].data.clone()
                 vae.decoder = new_vae.decoder
             if hasattr(new_vae, "post_quant_conv") and new_vae.post_quant_conv is not None:
+                if hasattr(vae, "post_quant_conv") and vae.post_quant_conv is not None:
+                    new_params = dict(new_vae.post_quant_conv.named_parameters())
+                    for p_name, p in vae.post_quant_conv.named_parameters():
+                        if p_name in new_params:
+                            p.data = new_params[p_name].data.clone()
                 vae.post_quant_conv = new_vae.post_quant_conv
             t_el = time.perf_counter() - t0
             log_debug(f"[ON-DEMAND DISK-TO-RAM] Video VAE Decoder berjaya dimuatkan semula melalui loader rasmi ({t_el:.3f}s).")
@@ -3715,8 +3796,22 @@ try:
             upsampling = getattr(vae, "upsampling", False)
             new_vae = h3_main._load_video_vae(fn, qkv_splitting=bool(split_map), upsampling=upsampling)
             if hasattr(new_vae, "encoder") and new_vae.encoder is not None:
+                if hasattr(vae, "encoder") and vae.encoder is not None:
+                    new_params = dict(new_vae.encoder.named_parameters())
+                    for p_name, p in vae.encoder.named_parameters():
+                        if p_name in new_params:
+                            p.data = new_params[p_name].data.clone()
+                    new_bufs = dict(new_vae.encoder.named_buffers())
+                    for b_name, b in vae.encoder.named_buffers():
+                        if b_name in new_bufs:
+                            b.data = new_bufs[b_name].data.clone()
                 vae.encoder = new_vae.encoder
             if hasattr(new_vae, "quant_conv") and new_vae.quant_conv is not None:
+                if hasattr(vae, "quant_conv") and vae.quant_conv is not None:
+                    new_params = dict(new_vae.quant_conv.named_parameters())
+                    for p_name, p in vae.quant_conv.named_parameters():
+                        if p_name in new_params:
+                            p.data = new_params[p_name].data.clone()
                 vae.quant_conv = new_vae.quant_conv
             t_el = time.perf_counter() - t0
             log_debug(f"[ON-DEMAND DISK-TO-RAM] Video VAE Encoder berjaya dimuatkan semula melalui loader rasmi ({t_el:.3f}s).")
@@ -3932,7 +4027,8 @@ try:
                     val = sd[p_name]
                     if val.dtype != p.dtype:
                         val = val.to(dtype=p.dtype)
-                    p.data = val
+                    p.data = val.clone()
+                    reloaded += 1
             for m in audio_vae.modules():
                 if hasattr(m, "zero_k_bias"):
                     zkb = getattr(m, "zero_k_bias", None)
@@ -4061,7 +4157,7 @@ try:
                     val = sd[p_name]
                     if val.dtype != p.dtype:
                         val = val.to(dtype=p.dtype)
-                    p.data = val
+                    p.data = val.clone()
                     reloaded += 1
             del sd
             t_el = time.perf_counter() - t0
