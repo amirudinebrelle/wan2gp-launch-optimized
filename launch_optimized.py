@@ -5296,16 +5296,19 @@ try:
                 else:
                     qkv_peak_bytes = full_qkv_bytes + (full_qkv_bytes // 3)
                 
-                # Keperluan puncak kitaran penuh perhatian (QKV + Attention + RoPE + OutProj)
+                # Keperluan puncak kitaran penuh perhatian (QKV + Attention + RoPE + OutProj + Kernel Workspace)
                 out_proj_bytes = seq_len * out_f * x.element_size()
                 rope_scratch_bytes = (seq_len * inner * x.element_size()) // 2
-                single_pass_peak = qkv_peak_bytes + attn_out_bytes + out_proj_bytes + rope_scratch_bytes
+                attn_workspace_bytes = seq_len * inner * x.element_size()
+                bare_attn_peak = qkv_peak_bytes + attn_out_bytes + out_proj_bytes + rope_scratch_bytes + attn_workspace_bytes
+                # Nisbah dinamik alokator PyTorch (1.2x faktor pembundaran blok penimbal CUDA)
+                single_pass_peak = int(bare_attn_peak * 1.2)
 
                 # Syarat Single-Pass Matematik Tulen (100% Zero Hardcoding):
-                # Hanya dibenarkan jika VRAM bebas fizikal melepasi puncak kitaran penuh perhatian
-                # dan meninggalkan baki ruang selamat sekurang-kurangnya bersamaan penimbal WDDM.
+                # Hanya dibenarkan jika memori bebas pemandu fizikal (free_bytes) melepasi puncak kitaran penuh perhatian
+                # dan meninggalkan baki ruang selamat sekurang-kurangnya bersamaan penimbal WDDM (wddm_safe_guard_bytes).
                 # Jika tidak, pecahan seimbang dinamik (chunking) akan memproses jujukan besar tanpa risiko limpahan memori WDDM.
-                can_single_pass = (not is_retry) and (effective_free >= single_pass_peak + wddm_safe_guard_bytes)
+                can_single_pass = (not is_retry) and (free_bytes >= single_pass_peak + wddm_safe_guard_bytes)
 
                 do_prof = _h3_diag["prof_active"] and not is_retry
                 if do_prof and torch.cuda.is_available():
@@ -5533,7 +5536,7 @@ try:
 
                 # Tentukan sama ada out_proj boleh dijalankan secara satu laluan penuh berasaskan saiz bait sebenar
                 out_proj_bytes = seq_len * out_f * output.element_size()
-                can_out_single_pass = (not is_retry) and (effective_free >= out_proj_bytes + wddm_safe_guard_bytes)
+                can_out_single_pass = (not is_retry) and (free_bytes >= out_proj_bytes + wddm_safe_guard_bytes)
                 if seq_len > chunk_tokens and (not can_single_pass or not can_out_single_pass):
                     res_out = torch.empty(seq_len, out_f, dtype=output.dtype, device=output.device)
                     for start_i in range(0, seq_len, chunk_tokens):
