@@ -3209,7 +3209,7 @@ try:
         try:
             from shared.utils import files_locator as fl
             from mmgp import offload
-            from models.minimax_h3.minimax_h3_main import VIDEO_VAE_FILE, get_video_vae_linear_split_map
+            from models.minimax_h3.minimax_h3_main import VIDEO_VAE_FILE
             fn = getattr(vae, "_source_file", None)
             if not fn or not os.path.exists(fn):
                 fn = fl.locate_file("ckpts/minimax_h3_video_vae_fp8mix.safetensors", error_if_none=False)
@@ -3228,7 +3228,7 @@ try:
             if upsampling:
                 for name in [k for k in sd if k.startswith("detail_b32.")]:
                     del sd[name]
-            split_map = getattr(vae, "split_linear_modules_map", None) or get_video_vae_linear_split_map()
+            split_map = getattr(vae, "split_linear_modules_map", None)
             if split_map:
                 dtype = getattr(vae, "_model_dtype", torch.float16)
                 sd, _ = offload.split_fused_weights(sd, None, split_map, default_dtype=dtype, verboseLevel=-1)
@@ -3257,7 +3257,7 @@ try:
         try:
             from shared.utils import files_locator as fl
             from mmgp import offload
-            from models.minimax_h3.minimax_h3_main import VIDEO_VAE_FILE, get_video_vae_linear_split_map
+            from models.minimax_h3.minimax_h3_main import VIDEO_VAE_FILE
             fn = getattr(vae, "_source_file", None)
             if not fn or not os.path.exists(fn):
                 fn = fl.locate_file("ckpts/minimax_h3_video_vae_fp8mix.safetensors", error_if_none=False)
@@ -3267,7 +3267,7 @@ try:
                 return 0
             t0 = time.perf_counter()
             sd, _ = offload._safetensors_load_file(fn, writable_tensors=False)
-            split_map = getattr(vae, "split_linear_modules_map", None) or get_video_vae_linear_split_map()
+            split_map = getattr(vae, "split_linear_modules_map", None)
             if split_map:
                 dtype = getattr(vae, "_model_dtype", torch.float16)
                 sd, _ = offload.split_fused_weights(sd, None, split_map, default_dtype=dtype, verboseLevel=-1)
