@@ -2211,6 +2211,9 @@ def centralized_model_memory_arbiter(
             info = inspect_model_data(mod_obj)
 
         hidden_dim = info.get("hidden_dim", 0) or 3072
+        inner_dim = info.get("inner_dim", 0) or generation_state.get("active_inner_dim", 0) or hidden_dim
+        if not inner_dim:
+            inner_dim = hidden_dim if hidden_dim > 0 else 3072
         total_layers = info.get("layers", 0)
         block_size_mb = info.get("block_size_mb", 0.0) or info.get("block_storage_mb", 0.0)
         base_size_mb = info.get("base_size_mb", 0.0)
@@ -2447,9 +2450,8 @@ def centralized_model_memory_arbiter(
         else:
             if effective_block_mb > 0:
                 max_fit = int(usable_mb // effective_block_mb)
-                # Pada GPU <= 8.5GB (RTX 5050 8GB GDDR6), hadkan penimbal pra-muat kepada 0-3 blok
-                # Pemindahan PCIe DMA 13ms ditutupi 100% oleh pengiraan blok 500-800ms
-                max_preload_cap = 3 if total_gpu_mb <= 8500.0 else max(1, total_layers - 2)
+                # Penimbal pra-muat dinamik berasaskan nisbah pemindahan PCIe DMA vs saiz perkakasan VRAM (100% Zero Hardcoding)
+                max_preload_cap = max(1, min(math.ceil(total_gpu_mb / 2048.0), total_layers - 2))
                 if max_fit >= 2:
                     preload_blocks = min(max_preload_cap, max(0, max_fit - 2))
                     safe_budget_mb = int(base_size_mb + (preload_blocks + 2) * effective_block_mb)
@@ -5255,7 +5257,7 @@ try:
                     qkv_peak_bytes = dest_qkv_bytes
                 else:
                     qkv_peak_bytes = full_qkv_bytes + (full_qkv_bytes // 3)
-                single_pass_peak = qkv_peak_bytes + wddm_safe_guard_bytes
+                single_pass_peak = qkv_peak_bytes + attn_out_bytes + wddm_safe_guard_bytes
 
                 # Syarat Single-Pass Matematik Tulen:
                 # Jika VRAM bebas fizikal mencukupi puncak serentak unjuran, laksanakan secara satu laluan penuh pantas.
@@ -6269,19 +6271,13 @@ def main():
                                 for p in sub_m.parameters():
                                     if p is not None and getattr(p, "is_cuda", False):
                                         try:
-                                            st = p.untyped_storage()
-                                            if st.is_cuda and st.size() > 0:
-                                                st.resize_(0)
-                                            p.data = torch.empty(0, device="cpu")
+                                            p.data = p.data.to("cpu")
                                         except Exception:
                                             pass
                                 for b in sub_m.buffers():
                                     if b is not None and getattr(b, "is_cuda", False):
                                         try:
-                                            st = b.untyped_storage()
-                                            if st.is_cuda and st.size() > 0:
-                                                st.resize_(0)
-                                            b.data = torch.empty(0, device="cpu")
+                                            b.data = b.data.to("cpu")
                                         except Exception:
                                             pass
                     # 2. Modul-modul lain dalam pipeline
@@ -6291,25 +6287,19 @@ def main():
                             for p in comp.parameters():
                                 if p is not None and getattr(p, "is_cuda", False):
                                     try:
-                                        st = p.untyped_storage()
-                                        if st.is_cuda and st.size() > 0:
-                                            st.resize_(0)
-                                        p.data = torch.empty(0, device="cpu")
+                                        p.data = p.data.to("cpu")
                                     except Exception:
                                         pass
                             for b in comp.buffers():
                                 if b is not None and getattr(b, "is_cuda", False):
                                     try:
-                                        st = b.untyped_storage()
-                                        if st.is_cuda and st.size() > 0:
-                                            st.resize_(0)
-                                        b.data = torch.empty(0, device="cpu")
+                                        b.data = b.data.to("cpu")
                                     except Exception:
                                         pass
             except Exception:
                 pass
 
-            # C. Pembersihan Mutlak Cache CUDA, MMap & RAM Hos (Zero VRAM Leak)
+            # C. Pembersihan Mutlak Cache CUDA, MMap & RAM Hos (Zero VRAM Leak, Zero Destruction)
             try:
                 from shared.cuda_memory import release_ram_cache
                 release_ram_cache()
@@ -6332,24 +6322,8 @@ def main():
             except Exception:
                 pass
 
-            import gc
-            for obj in list(gc.get_objects()):
-                try:
-                    if torch.is_tensor(obj) and obj.is_cuda:
-                        try:
-                            st = obj.untyped_storage()
-                            if st.is_cuda and st.size() > 0:
-                                st.resize_(0)
-                        except Exception:
-                            pass
-                        obj.data = torch.empty(0, device="cpu")
-                    elif isinstance(obj, torch.storage.UntypedStorage) and obj.is_cuda and obj.size() > 0:
-                        try:
-                            obj.resize_(0)
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
+            flush_vram()
+            _vacuum_vmm_orphan_allocations()
             gc.collect()
             if torch.cuda.is_available():
                 try:
