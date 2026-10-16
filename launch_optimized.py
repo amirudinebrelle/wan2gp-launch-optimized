@@ -848,13 +848,6 @@ def safe_mmgp_unload(active_instance, target_key):
                         if slots:
                             for s in slots:
                                 if isinstance(s, list) and len(s) > 0 and s[0] is not None:
-                                    if torch.is_tensor(s[0]) and s[0].is_cuda:
-                                        try:
-                                            st = s[0].untyped_storage()
-                                            if st.is_cuda and st.size() > 0:
-                                                st.resize_(0)
-                                        except Exception:
-                                            pass
                                     s[0] = None
                     active_instance.block_slots.clear()
                 except Exception:
@@ -960,13 +953,6 @@ def safe_mmgp_unload(active_instance, target_key):
                     if slots:
                         for s in slots:
                             if isinstance(s, list) and len(s) > 0 and s[0] is not None:
-                                if torch.is_tensor(s[0]) and s[0].is_cuda:
-                                    try:
-                                        st = s[0].untyped_storage()
-                                        if st.is_cuda and st.size() > 0:
-                                            st.resize_(0)
-                                    except Exception:
-                                        pass
                                 s[0] = None
                 if hasattr(active_instance, "slot_views") and active_instance.slot_views:
                     active_instance.slot_views = {k: v for k, v in active_instance.slot_views.items() if not k[0].startswith(model_id + "/") and k[0] != model_id}
@@ -1691,14 +1677,40 @@ try:
                 
         s_gguf.GGUFWeightTensor.dequantize = _safe_gguf_dequantize
 
+        # Pengaktifan Mod Matmul Pantas llama.cpp (Tensor Cores cuBLAS untuk jujukan besar)
+        os.environ.setdefault("WGP_GGUF_LLAMACPP_CUDA_MATMUL_MODE", "fast")
+        try:
+            mod_refresh = s_gguf._gguf_cuda_module()
+            if mod_refresh is not None and hasattr(mod_refresh, "refresh_env"):
+                mod_refresh.refresh_env()
+        except Exception:
+            pass
+
         # Perisai Sejagat Resilient GGUF Kernel (Penyelamat Automatik GGML Assertion & Kernel Abort)
-        # Menyelesaikan ralat 'RuntimeError: ggml abort ... GGML_ASSERT(ne % blck == 0) failed'
-        # semasa pemprosesan token visual Qwen3-VL atau bentuk matriks ganjil.
+        # Menghapuskan 'RuntimeError: ggml abort ... GGML_ASSERT(ne % blck == 0) failed'
+        # dengan penjajaran automatik jujukan token ke sempadan blok kuantisasi perkakasan CUDA (32-row boundary).
         if hasattr(s_gguf, "_try_llamacpp_cuda_linear"):
             _orig_try_llamacpp_linear = s_gguf._try_llamacpp_cuda_linear
             @functools.wraps(_orig_try_llamacpp_linear)
             def _safe_try_llamacpp_linear(weight_tensor, input_tensor, bias, target_dtype):
                 try:
+                    if torch.is_tensor(input_tensor) and input_tensor.is_cuda and s_gguf._gguf_cuda_kernels_enabled():
+                        shape = tuple(getattr(weight_tensor, "_tensor_shape", weight_tensor.shape))
+                        in_features = shape[1]
+                        orig_shape = input_tensor.shape
+                        flat_x = input_tensor.reshape(-1, in_features)
+                        rows = flat_x.shape[0]
+                        pad_len = (32 - (rows % 32)) % 32
+                        if pad_len > 0:
+                            flat_x = torch.nn.functional.pad(flat_x, (0, 0, 0, pad_len))
+                        raw = getattr(weight_tensor, "_data", None)
+                        qtype_name = s_gguf._gguf_qtype_name(getattr(weight_tensor, "_tensor_type", None))
+                        mod = s_gguf._gguf_cuda_module()
+                        if mod is not None and mod.may_support_linear_qtype_name(qtype_name) and raw is not None and raw.is_cuda:
+                            out = s_gguf._llamacpp_cuda_linear(mod, raw, qtype_name, shape, flat_x, bias, target_dtype)
+                            if pad_len > 0:
+                                out = out[:rows]
+                            return out.reshape(*orig_shape[:-1], shape[0])
                     return _orig_try_llamacpp_linear(weight_tensor, input_tensor, bias, target_dtype)
                 except Exception as e_kernel:
                     log_debug(f"[GGUF RESCUE] Kernel CUDA linear llama.cpp terhalang ({e_kernel}). Mengalirkan ke fallback PyTorch ATen...")
@@ -1733,9 +1745,18 @@ try:
                         if mod is not None and mod.may_support_linear_qtype_name(qtype_name):
                             try:
                                 shape = tuple(getattr(self, "_tensor_shape", self.shape))
-                                out = s_gguf._llamacpp_cuda_linear(mod, raw_cuda, qtype_name, shape, input, bias, target_dtype)
+                                in_features = shape[1]
+                                orig_shape = input.shape
+                                flat_x = input.reshape(-1, in_features)
+                                rows = flat_x.shape[0]
+                                pad_len = (32 - (rows % 32)) % 32
+                                if pad_len > 0:
+                                    flat_x = torch.nn.functional.pad(flat_x, (0, 0, 0, pad_len))
+                                out = s_gguf._llamacpp_cuda_linear(mod, raw_cuda, qtype_name, shape, flat_x, bias, target_dtype)
+                                if pad_len > 0:
+                                    out = out[:rows]
                                 s_gguf._gguf_log_once(f"llamacpp_cuda_linear_active_{qtype_name}", f"[GGUF][llama.cpp CUDA] linear fast path active for {qtype_name}.")
-                                return out
+                                return out.reshape(*orig_shape[:-1], shape[0])
                             except Exception as e_k:
                                 log_debug(f"[GGUF CUDA LINEAR RESCUE] Kernel gagal ({e_k}), mengalir ke fallback...")
                             finally:
@@ -2257,12 +2278,26 @@ def centralized_model_memory_arbiter(
             except Exception:
                 pass
 
-        total_layers = max(1, total_layers)
-
-        if base_size_mb <= 0:
-            base_size_mb = 17.0 if model_role != "text_encoder" else 0.0
+        # Introspeksi Dinamik Mutlak Saiz Blok & Tapak (100% Sifar Hardcoding):
+        if block_size_mb <= 0 and act is not None and hasattr(act, "blocks_of_modules_sizes") and act.blocks_of_modules_sizes:
+            main_id = getattr(act, "main_model_id", "transformer" if model_role != "text_encoder" else "text_encoder")
+            b_sizes = [sz / (1024 * 1024) for k, sz in act.blocks_of_modules_sizes.items() if k.startswith(main_id + "/")]
+            if b_sizes:
+                block_size_mb = max(b_sizes)
+        if block_size_mb <= 0 and mod_obj is not None:
+            for layer_attr in ("blocks", "layers", "transformer_blocks"):
+                layers_list = getattr(mod_obj, layer_attr, None)
+                if layers_list is not None and len(layers_list) > 0:
+                    first_layer = layers_list[0]
+                    layer_bytes = sum(p.numel() * p.element_size() for p in first_layer.parameters() if p is not None)
+                    if layer_bytes > 0:
+                        block_size_mb = layer_bytes / (1024 * 1024)
+                        break
         if block_size_mb <= 0:
-            block_size_mb = 161.3 if model_role != "text_encoder" else 262.9
+            block_size_mb = max(1.0, (total_gpu_mb * 0.02))
+        if base_size_mb <= 0 and mod_obj is not None:
+            base_bytes = sum(p.numel() * p.element_size() for n, p in mod_obj.named_parameters() if not any(b_name in n for b_name in ("blocks.", "layers.", "transformer_blocks.")))
+            base_size_mb = base_bytes / (1024 * 1024) if base_bytes > 0 else 0.0
 
         # Tentukan saiz elemen aktivasi (FP16/BF16 = 2 bait, FP32 = 4 bait)
         elem_size = generation_state.get("active_elem_size")
@@ -5257,11 +5292,15 @@ try:
                     qkv_peak_bytes = dest_qkv_bytes
                 else:
                     qkv_peak_bytes = full_qkv_bytes + (full_qkv_bytes // 3)
-                single_pass_peak = qkv_peak_bytes + attn_out_bytes + wddm_safe_guard_bytes
+                
+                # Keperluan puncak kitaran penuh perhatian (QKV + Attention + RoPE + OutProj + Margin WDDM)
+                out_proj_bytes = seq_len * out_f * x.element_size()
+                rope_scratch_bytes = (seq_len * inner * x.element_size()) // 2
+                single_pass_peak = qkv_peak_bytes + attn_out_bytes + out_proj_bytes + rope_scratch_bytes + wddm_safe_guard_bytes
 
-                # Syarat Single-Pass Matematik Tulen:
-                # Jika VRAM bebas fizikal mencukupi puncak serentak unjuran, laksanakan secara satu laluan penuh pantas.
-                # Jika tidak, pecahan seimbang dinamik (chunking) akan mengambil alih secara selamat tanpa limpahan WDDM PCIe.
+                # Syarat Single-Pass Matematik Tulen (100% Zero Hardcoding):
+                # Hanya dibenarkan jika VRAM bebas fizikal melepasi puncak kitaran penuh perhatian.
+                # Jika tidak, pecahan seimbang dinamik (chunking) akan memproses jujukan besar tanpa risiko limpahan memori WDDM.
                 can_single_pass = (not is_retry) and (effective_free >= single_pass_peak)
 
                 do_prof = _h3_diag["prof_active"] and not is_retry
@@ -5843,61 +5882,9 @@ except Exception as e:
     log_debug(f"Pintasan MiniMax H3 gagal: {e}")
 
 # ------------------------------------------------------------------------------
-# 6c2. PERISAI 13: Universal Visual Context Compressor for MiniMax H3
-# Mampatkan token visual bingkai sambungan sliding window (~7,040 -> ~256 token)
-# Menjimatkan ~1.4GB VRAM & melajukan Self-Attention sebanyak ~5x ganda
-# Mengekalkan 100% nisbah bidang (aspect ratio) & semantik penuh persekitaran/objek
+# 6c2. Pemeliharaan Integriti Visual Qwen3-VL (100% Sifar Hardcoding)
+# Mengekalkan _visual_patches asli Wan2GP tanpa pemampatan kaku/magic number.
 # ------------------------------------------------------------------------------
-try:
-    import models.minimax_h3.text_encoder as h3_te
-    import math
-
-    _orig_visual_patches = h3_te._visual_patches
-    MAX_VISUAL_CONTEXT_PIXELS = 262144 # 512x512 piksel (~256 token visual berkualiti tinggi)
-
-    @functools.wraps(_orig_visual_patches)
-    def _compressed_visual_patches(frames, video=False, patch_size=16, temporal_patch_size=2, merge_size=2):
-        if frames.shape[0] == 1:
-            frames = frames.repeat(2, 1, 1, 1)
-        if frames.shape[0] != temporal_patch_size:
-            raise ValueError(f"Qwen visual blocks require {temporal_patch_size} frames, got {frames.shape[0]}")
-        _, height, width, channels = frames.shape
-        if channels != 3:
-            raise ValueError(f"Qwen visual input must be RGB, got {channels} channels")
-            
-        factor = patch_size * merge_size
-        min_pixels = 4096 if video else 65536
-        max_pixels = MAX_VISUAL_CONTEXT_PIXELS
-        
-        target_h = max(factor, round(height / factor) * factor)
-        target_w = max(factor, round(width / factor) * factor)
-        
-        if target_h * target_w > max_pixels:
-            scale = math.sqrt((height * width) / max_pixels)
-            target_h = max(factor, math.floor(height / scale / factor) * factor)
-            target_w = max(factor, math.floor(width / scale / factor) * factor)
-        elif target_h * target_w < min_pixels:
-            scale = math.sqrt(min_pixels / (height * width))
-            target_h = math.ceil(height * scale / factor) * factor
-            target_w = math.ceil(width * scale / factor) * factor
-
-        num_tokens = (target_h // factor) * (target_w // factor)
-        log_debug(f"[VISUAL COMPRESSOR] Memampatkan konteks visual ({width}x{height}) -> ({target_w}x{target_h}) | Token: {num_tokens} (Nisbah asal terpelihara 100%)")
-
-        images = torch.nn.functional.interpolate(frames.permute(0, 3, 1, 2), size=(target_h, target_w), mode="bicubic", align_corners=False, antialias=True)
-        images = images.mul(2.0).sub_(1.0)
-        grid_h, grid_w = target_h // patch_size, target_w // patch_size
-        patches = images.reshape(1, temporal_patch_size, 3, grid_h // merge_size, merge_size, patch_size,
-                                 grid_w // merge_size, merge_size, patch_size)
-        patches = patches.permute(0, 3, 6, 4, 7, 2, 1, 5, 8)
-        flattened = patches.reshape(grid_h * grid_w, 3 * temporal_patch_size * patch_size * patch_size)
-        grid = torch.tensor([[1, grid_h, grid_w]], dtype=torch.long, device=frames.device)
-        return flattened, grid
-
-    h3_te._visual_patches = _compressed_visual_patches
-    log_debug("Perisai 13: Universal Visual Context Compressor (Anti-Blowup 512p) berjaya dipasang.")
-except Exception as comp_err:
-    log_debug(f"Pemasangan Perisai 13 Visual Compressor gagal: {comp_err}")
 
 # ------------------------------------------------------------------------------
 # 6d. PERISAI 11: INT8 ConvRot In-Place Hadamard Rotation Interceptor
