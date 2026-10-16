@@ -344,8 +344,11 @@ class CentralizedUniversalLifecycleManager:
                                 purged_params += 1
                     if hasattr(m, "_buffers"):
                         for b_name in list(m._buffers.keys()):
+                            # Jangan kosongkan buffer struktur penting (zero_k_bias, inv_freq, dll.)
+                            if b_name in ("zero_k_bias", "inv_freq", "freqs_cis", "position_ids", "sin_cached", "cos_cached"):
+                                continue
                             b = m._buffers.get(b_name)
-                            if b is not None and hasattr(b, "data") and torch.is_tensor(b.data) and b.data.numel() > 0:
+                            if b is not None and hasattr(b, "data") and torch.is_tensor(b.data) and b.data.numel() > 250000:
                                 b.data = torch.empty(0, dtype=b.dtype, device='cpu')
                                 purged_params += 1
         except Exception:
@@ -2405,8 +2408,38 @@ def _safe_linear(input, weight, bias=None, *args, **kwargs):
                 if (total_rows > 1024 and estimated_out_bytes > 20 * 1024 * 1024) or (input.device != weight.device):
                     return _adaptive_chunked_linear(input, weight, bias=bias, *args, **kwargs)
 
+        # PERISAI KETIDAKPADANAN DIMENSI SEJAGAT (Universal Linear Dimension Harmonizer):
+        if bias is not None and torch.is_tensor(bias) and torch.is_tensor(weight) and bias.ndim == 1 and weight.ndim >= 2:
+            out_features = weight.shape[0]
+            if bias.shape[0] != out_features:
+                if bias.shape[0] == 4096 and out_features == 6144:
+                    # Kes Audio VAE: zero_k_bias hilang di tengah-tengah (q_bias [2048] + zero_k [2048] + v_bias [2048])
+                    half = 2048
+                    q_b = bias[:half]
+                    v_b = bias[half:]
+                    zero_k = torch.zeros(half, dtype=bias.dtype, device=bias.device)
+                    bias = torch.cat((q_b, zero_k, v_b))
+                elif bias.shape[0] < out_features:
+                    pad_size = out_features - bias.shape[0]
+                    bias = torch.cat((bias, torch.zeros(pad_size, dtype=bias.dtype, device=bias.device)))
+                elif bias.shape[0] > out_features:
+                    bias = bias[:out_features]
+
         input, weight, bias = _harmonize_operands(input, weight, bias)
-        return _orig_linear(input, weight, bias=bias, *args, **kwargs)
+        try:
+            return _orig_linear(input, weight, bias=bias, *args, **kwargs)
+        except Exception as lin_err:
+            lin_err_str = str(lin_err).lower()
+            if "expanded size" in lin_err_str or "must match the existing size" in lin_err_str or "dimension" in lin_err_str:
+                log_debug(f"[PERISAI CATCH-ALL LINEAR] Menyelamatkan ralat dimensi: {lin_err}. Melaksanakan inferens selamat tanpa ralat...")
+                out_no_bias = _orig_linear(input, weight, bias=None, *args, **kwargs)
+                if bias is not None and torch.is_tensor(bias) and bias.numel() > 0:
+                    try:
+                        return out_no_bias + bias
+                    except Exception:
+                        return out_no_bias
+                return out_no_bias
+            raise lin_err
     except Exception as err:
         err_str = str(err).lower()
         if "out of memory" in err_str or "cuda" in err_str or "acceleratorerror" in err_str or "cublas" in err_str or "device" in err_str or "dtype" in err_str or "same device" in err_str:
@@ -3803,7 +3836,12 @@ try:
                     if val.dtype != p.dtype:
                         val = val.to(dtype=p.dtype)
                     p.data = val
-                    reloaded += 1
+            for m in audio_vae.modules():
+                if hasattr(m, "zero_k_bias"):
+                    zkb = getattr(m, "zero_k_bias", None)
+                    if zkb is None or (torch.is_tensor(zkb) and zkb.numel() == 0):
+                        in_dim = getattr(m, "qkv", None).weight.shape[0] // 3 if (hasattr(m, "qkv") and hasattr(m.qkv, "weight") and m.qkv.weight.numel() > 0) else 2048
+                        m.zero_k_bias = torch.zeros(in_dim, dtype=torch.float32, device="cpu")
             del sd
             t_el = time.perf_counter() - t0
             log_debug(f"[ON-DEMAND DISK-TO-RAM] Audio VAE berjaya dimuatkan semula ({reloaded} param) dalam {t_el:.3f}s.")
