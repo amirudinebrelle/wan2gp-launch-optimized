@@ -3445,9 +3445,13 @@ try:
     @staticmethod
     def _safe_h3_get_vae_tile_size(vae_config, device_mem_capacity, mixed_precision):
         if vae_config == 0:
-            if device_mem_capacity >= 6000:
+            free_mb = get_realtime_vram_available()
+            # Uji kapasiti bebas sebenar: 512 tile memerlukan ~2.2GB VRAM bersih
+            if free_mb >= 2400.0 or device_mem_capacity >= 6000.0:
                 return 512
-            return 256
+            elif free_mb >= 1200.0:
+                return 256
+            return 128
         return {1: 0, 2: 512, 3: 256}.get(int(vae_config), 128)
 
     h3_video_vae.MiniMaxH3VideoVAE.get_VAE_tile_size = _safe_h3_get_vae_tile_size
@@ -4661,7 +4665,16 @@ try:
                                 if tuned_b > act_inst.budgets.get("transformer", 0):
                                     act_inst.budgets["transformer"] = tuned_b
                                     act_inst.budgets["*"] = tuned_b
-                                    log_debug(f"[KALIBRASI DINAMIK MMGP] Bajet VRAM dilaras semula secara empirikal mengikut denyutan aktivasi ({pulse_mb:.0f}MB): {tuned_b}MB.")
+                                    try:
+                                        towers_names = get_model_towers(act_inst, "transformer")
+                                        if not towers_names:
+                                            import mmgp.offload as mo
+                                            towers_names, _ = mo._detect_main_towers(trans_mod)
+                                            towers_names = [t for t in towers_names if "token_refiner" not in t]
+                                        act_inst.tune_preloading("transformer", tuned_b * 1024 * 1024, towers_names)
+                                    except Exception:
+                                        pass
+                                    log_debug(f"[KALIBRASI DINAMIK MMGP] Bajet VRAM dan jadual pra-muat MMGP dilaras semula secara empirikal mengikut denyutan aktivasi ({pulse_mb:.0f}MB): {tuned_b}MB.")
                         except Exception as cal_err:
                             log_debug(f"Notis kalibrasi bajet MMGP: {cal_err}")
             else:
