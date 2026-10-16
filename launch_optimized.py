@@ -762,6 +762,20 @@ def safe_mmgp_unload(active_instance, target_key):
                 if hasattr(active_instance, "loaded_blocks") and active_instance.loaded_blocks.get(model_id):
                     active_instance.gpu_unload_blocks(model_id, active_instance.loaded_blocks[model_id])
                     active_instance.loaded_blocks[model_id] = None
+                if hasattr(active_instance, "blocks_of_modules") and active_instance.blocks_of_modules:
+                    for entry_name in list(active_instance.blocks_of_modules.keys()):
+                        if entry_name.startswith(model_id + "/"):
+                            try:
+                                b_name = entry_name[len(model_id) + 1:]
+                                active_instance.gpu_unload_blocks(model_id, b_name)
+                            except Exception:
+                                pass
+                if hasattr(active_instance, "inflight"):
+                    for entry in [e for e in list(active_instance.inflight.keys()) if e.startswith(model_id + "/")]:
+                        try:
+                            active_instance.gpu_unload_blocks(model_id, entry[len(model_id) + 1:])
+                        except Exception:
+                            pass
                 # Segerakkan active_models_ids dan active_models secara dinamik:
                 # Memastikan MMGP mengetahui model ini tidak lagi di GPU,
                 # supaya ensure_model_loaded(model_id) memuatkannya ke GPU secara sah jika dipanggil kemudian.
@@ -1760,10 +1774,11 @@ def compute_dynamic_transformer_budget(transformer_module=None, is_async=True, p
             # 5. Penimbal enjin attention workspace (SageAttention 2 SM120 natif tanpa matrik N*N):
             engine_mb = float((total_tokens * inner_dim * elem_size * 0.25) / (1024 * 1024))
             
-            # Puncak serentak DiTBlock attention sebenar (mengelakkan anggaran 7GB melampau yang melumpuhkan muatan blok):
-            dit_peak_act_mb = dest_qkv_mb + attn_out_mb + chunk_work_mb + residual_mb + engine_mb
+            # Puncak serentak DiTBlock attention sebenar bagi Single-Pass (Ground-Truth Hardware Physics):
+            # Penimbal destinasi Q, K, V (dest_qkv_mb) + keluaran attention (attn_out_mb) + residual input (residual_mb) + workspace enjin (engine_mb)
+            dit_peak_act_mb = dest_qkv_mb + attn_out_mb + residual_mb + engine_mb
             if attn_headroom_mb > 0:
-                effective_act_headroom_mb = min(attn_headroom_mb, dit_peak_act_mb)
+                effective_act_headroom_mb = max(attn_headroom_mb, dit_peak_act_mb)
             else:
                 effective_act_headroom_mb = dit_peak_act_mb
         
@@ -3969,7 +3984,24 @@ try:
                 _orig_use_trans(self)
                 try:
                     active_inst = get_active_mmgp_instance()
-                    # 1. Nyahmuat semua modul dorman bukan transformer secara dinamik (Zero Hardcoding)
+                    # 1. Pindahkan sebarang tensor CUDA modul pembantu ke CPU secara mutlak
+                    for mod_name in ("text_encoder", "vision_encoder", "video_encoder", "audio_vae", "vae", "latent_upscaler"):
+                        mod = getattr(self, mod_name, None)
+                        if mod is not None and hasattr(mod, "parameters"):
+                            for p in mod.parameters():
+                                if p is not None and p.is_cuda:
+                                    try:
+                                        p.data = p.data.to("cpu")
+                                    except Exception:
+                                        pass
+                            for b in mod.buffers():
+                                if b is not None and b.is_cuda:
+                                    try:
+                                        b.data = b.data.to("cpu")
+                                    except Exception:
+                                        pass
+
+                    # 2. Nyahmuat semua modul dorman bukan transformer dari MMGP secara dinamik (Zero Hardcoding)
                     if active_inst is not None:
                         for mid in list(active_inst.models.keys()):
                             if "transformer" not in str(mid).lower():
@@ -3978,7 +4010,7 @@ try:
                                 if m_entry is not None:
                                     setattr(m_entry, "_pinned_bytes", 0)
 
-                    # 2. Singkirkan bobot modul pembantu & pindahkan embed_tokens ke CPU secara terpilih (Zero Freeze)
+                    # 3. Singkirkan bobot modul pembantu & pindahkan embed_tokens ke CPU secara terpilih (Zero Freeze)
                     evict_h3_auxiliary_modules(self)
 
                     flush_vram()
@@ -3989,7 +4021,7 @@ try:
                             pass
                     gc.collect()
 
-                    # 3. Bebaskan blok alokasi RAM MMGP terus kepada Windows
+                    # 4. Bebaskan blok alokasi RAM MMGP terus kepada Windows
                     try:
                         from mmgp.allocator import ram as mmgp_ram
                         mmgp_ram.release()
@@ -4001,7 +4033,11 @@ try:
                     except Exception:
                         pass
 
-                    # 4. Tala semula bajet VRAM transformer secara fizik masa-nyata mengikut mod aktif (Audio vs Video)
+                    # 5. Pangkas halaman mmap dorman Text Encoder (14.6GB) daripada set kerja RAM fizikal Windows
+                    force_pagefile_push(force_trim=True)
+                    trim_current_process_working_set()
+
+                    # 6. Tala semula bajet VRAM transformer secara fizik masa-nyata mengikut mod aktif (Audio vs Video)
                     if active_inst is not None:
                         is_audio = getattr(self, "audio_only", False)
                         is_ref_mode = getattr(self, "reference_mode", False)
@@ -4014,9 +4050,9 @@ try:
                         channel_ratio = 2.0 if is_ref_mode else 1.0
                         retune_active_model_dynamically(active_inst, phase=1, token_scaling_ratio=channel_ratio, is_audio_only=is_audio, height=cur_h, width=cur_w, frame_num=cur_fn)
 
-                    # 5. Laporan Telemetri RAM Masa-Nyata Telus
+                    # 7. Laporan Telemetri RAM Masa-Nyata Telus (Ground-Truth Telemetry)
                     mem = psutil.virtual_memory()
-                    log_debug(f"[MINIMAX H3 LIFECYCLE] Fasa 1 (Encoding) selesai -> Modul pembantu dinyahmuat. RAM Hos: {mem.used/(1024**3):.2f} GB / {mem.total/(1024**3):.2f} GB ({mem.percent:.1f}%) | Bebas: {mem.available/(1024**3):.2f} GB. Gelung Denoising sedia berjalan pantas.")
+                    log_debug(f"[MINIMAX H3 LIFECYCLE] Fasa 1 (Encoding) selesai -> Modul pembantu dinyahmuat dari VRAM & mmap dipangkas dari RAM. RAM Hos: {mem.used/(1024**3):.2f} GB / {mem.total/(1024**3):.2f} GB ({mem.percent:.1f}%) | Bebas: {mem.available/(1024**3):.2f} GB. Gelung Denoising sedia berjalan pantas.")
                 except Exception as ex:
                     log_debug(f"[MINIMAX H3 LIFECYCLE] Ralat pelepasan Fasa 1: {ex}")
 
