@@ -4450,8 +4450,10 @@ try:
     def _safe_h3_get_vae_tile_size(vae_config, device_mem_capacity, mixed_precision):
         if vae_config == 0:
             free_mb = get_realtime_vram_available()
-            # Uji kapasiti bebas sebenar: 512 tile memerlukan ~2.2GB VRAM bersih
-            if free_mb >= 2400.0 or device_mem_capacity >= 6000.0:
+            # Dinamik Mengikut Ground-Truth VRAM Bebas Sebenar (Zero Hardcoding):
+            # Nilai lalai Wan2GP MiniMax H3 rasmi ialah 256.
+            # Hanya jika baki VRAM bebas lapang melebihi separuh kapasiti GPU dan >= 6000MB bebas barulah 512 digunakan.
+            if free_mb >= max(6000.0, device_mem_capacity * 0.65):
                 return 512
             elif free_mb >= 1200.0:
                 return 256
@@ -5274,7 +5276,8 @@ try:
                 full_qkv_bytes = seq_len * row_bytes
                 
                 # 4. Penimbal Keselamatan Anti-Paging Windows WDDM (dinamik mengikut saiz fizikal VRAM perkakasan):
-                wddm_safe_guard_bytes = max(256 * 1024 * 1024, int(total_bytes * 0.06))
+                ext_os_guard = max(0, total_bytes - free_bytes - torch.cuda.memory_reserved()) if torch.cuda.is_available() else 0
+                wddm_safe_guard_bytes = max(int(total_bytes * 0.15), ext_os_guard + int(total_bytes * 0.05))
 
                 # Puncak serentak fizikal sebenar unjuran satu-laluan (Single-Pass Ground-Truth Peak):
                 # Semasa Single-Pass non-split QKV: keluaran unjuran qkv (full_qkv_bytes) dihasilkan,
@@ -5293,15 +5296,16 @@ try:
                 else:
                     qkv_peak_bytes = full_qkv_bytes + (full_qkv_bytes // 3)
                 
-                # Keperluan puncak kitaran penuh perhatian (QKV + Attention + RoPE + OutProj + Margin WDDM)
+                # Keperluan puncak kitaran penuh perhatian (QKV + Attention + RoPE + OutProj)
                 out_proj_bytes = seq_len * out_f * x.element_size()
                 rope_scratch_bytes = (seq_len * inner * x.element_size()) // 2
-                single_pass_peak = qkv_peak_bytes + attn_out_bytes + out_proj_bytes + rope_scratch_bytes + wddm_safe_guard_bytes
+                single_pass_peak = qkv_peak_bytes + attn_out_bytes + out_proj_bytes + rope_scratch_bytes
 
                 # Syarat Single-Pass Matematik Tulen (100% Zero Hardcoding):
-                # Hanya dibenarkan jika VRAM bebas fizikal melepasi puncak kitaran penuh perhatian.
+                # Hanya dibenarkan jika VRAM bebas fizikal melepasi puncak kitaran penuh perhatian
+                # dan meninggalkan baki ruang selamat sekurang-kurangnya bersamaan penimbal WDDM.
                 # Jika tidak, pecahan seimbang dinamik (chunking) akan memproses jujukan besar tanpa risiko limpahan memori WDDM.
-                can_single_pass = (not is_retry) and (effective_free >= single_pass_peak)
+                can_single_pass = (not is_retry) and (effective_free >= single_pass_peak + wddm_safe_guard_bytes)
 
                 do_prof = _h3_diag["prof_active"] and not is_retry
                 if do_prof and torch.cuda.is_available():
@@ -5529,8 +5533,8 @@ try:
 
                 # Tentukan sama ada out_proj boleh dijalankan secara satu laluan penuh berasaskan saiz bait sebenar
                 out_proj_bytes = seq_len * out_f * output.element_size()
-                can_out_single_pass = (not is_retry) and (effective_free >= out_proj_bytes)
-                if seq_len > chunk_tokens and not can_out_single_pass:
+                can_out_single_pass = (not is_retry) and (effective_free >= out_proj_bytes + wddm_safe_guard_bytes)
+                if seq_len > chunk_tokens and (not can_single_pass or not can_out_single_pass):
                     res_out = torch.empty(seq_len, out_f, dtype=output.dtype, device=output.device)
                     for start_i in range(0, seq_len, chunk_tokens):
                         end_i = min(start_i + chunk_tokens, seq_len)
