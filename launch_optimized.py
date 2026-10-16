@@ -91,6 +91,32 @@ try:
 except Exception:
     pass
 
+# Pendaftaran Sejagat Format Kuantisasi & Sambungan GGUF pada Tahap Permulaan Modul
+try:
+    from mmgp import quant_router
+    _EARLY_HANDLER_MODULES = [
+        "shared.qtypes.scaled_fp8",
+        "shared.qtypes.nvfp4",
+        "shared.qtypes.bnb_nf4",
+        "shared.qtypes.nunchaku_int4",
+        "shared.qtypes.nunchaku_fp4",
+        "shared.qtypes.asym_w4a8_int8",
+        "shared.qtypes.int8_convrot",
+        "shared.qtypes.gptq_int4",
+        "shared.qtypes.gguf",
+    ]
+    for _h in _EARLY_HANDLER_MODULES:
+        try:
+            quant_router.register_handler(_h)
+        except Exception:
+            pass
+    from shared.qtypes import gguf as _early_gguf_handler
+    quant_router.register_file_extension("gguf", _early_gguf_handler)
+    quant_router.register_file_extension(".gguf", _early_gguf_handler)
+except Exception:
+    pass
+
+
 import torch
 import torch.nn.functional as F
 import psutil
@@ -1141,6 +1167,9 @@ torch.nn.functional.embedding = _safe_embedding
 _orig_conv3d = torch.nn.functional.conv3d
 _orig_conv2d = torch.nn.functional.conv2d
 _orig_conv1d = torch.nn.functional.conv1d
+_orig_conv_transpose1d = torch.nn.functional.conv_transpose1d
+_orig_conv_transpose2d = torch.nn.functional.conv_transpose2d
+_orig_conv_transpose3d = torch.nn.functional.conv_transpose3d
 
 def _harmonize_conv_operands(input, weight, bias=None):
     if not (torch.is_tensor(input) and torch.is_tensor(weight)):
@@ -1175,77 +1204,49 @@ def _harmonize_conv_operands(input, weight, bias=None):
 
     return input, weight, bias
 
-@functools.wraps(_orig_conv3d)
-def _resilient_conv3d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
-    input, weight, bias = _harmonize_conv_operands(input, weight, bias)
-    try:
-        return _orig_conv3d(input, weight, bias=bias, stride=stride, padding=padding, dilation=dilation, groups=groups)
-    except RuntimeError as conv_err:
-        err_s = str(conv_err).lower()
-        if "engine" in err_s or "cudnn" in err_s:
-            log_debug(f"[CUDNN RESCUE] cuDNN gagal mencari engine conv3d ({conv_err}). Mengaktifkan fallback PyTorch ATen native...")
-            with torch.backends.cudnn.flags(enabled=False):
-                safe_inp = input.contiguous() if torch.is_tensor(input) else input
-                safe_w = weight.contiguous() if torch.is_tensor(weight) else weight
-                safe_b = bias.contiguous() if (bias is not None and torch.is_tensor(bias)) else bias
-                return _orig_conv3d(safe_inp, safe_w, bias=safe_b, stride=stride, padding=padding, dilation=dilation, groups=groups)
-
-        if "type" in err_s or "device" in err_s or "should be the same" in err_s or "same device" in err_s or "contiguous" in err_s or "mismatch" in err_s:
-            log_debug(f"[CONV3D HARMONIZER RESCUE] Membetulkan ralat peranti/tipe Conv3D: {conv_err}. Menyelaras semula...")
-            target_dev = input.device if torch.is_tensor(input) else torch.device("cuda")
-            target_dt = input.dtype if torch.is_tensor(input) else torch.bfloat16
-            safe_inp = input.to(device=target_dev, dtype=target_dt).contiguous() if torch.is_tensor(input) else input
-            safe_w = weight.to(device=target_dev, dtype=target_dt).contiguous() if torch.is_tensor(weight) else weight
-            safe_b = bias.to(device=target_dev, dtype=target_dt).contiguous() if (bias is not None and torch.is_tensor(bias)) else bias
-            try:
+def _make_resilient_conv(orig_conv_fn, name="conv"):
+    @functools.wraps(orig_conv_fn)
+    def _resilient_wrapper(input, weight, bias=None, *args, **kwargs):
+        input, weight, bias = _harmonize_conv_operands(input, weight, bias)
+        try:
+            return orig_conv_fn(input, weight, bias=bias, *args, **kwargs)
+        except RuntimeError as conv_err:
+            err_s = str(conv_err).lower()
+            if "engine" in err_s or "cudnn" in err_s:
+                log_debug(f"[CUDNN RESCUE] cuDNN gagal mencari engine {name} ({conv_err}). Mengaktifkan fallback PyTorch ATen native...")
                 with torch.backends.cudnn.flags(enabled=False):
-                    return _orig_conv3d(safe_inp, safe_w, bias=safe_b, stride=stride, padding=padding, dilation=dilation, groups=groups)
-            except Exception as retry_err:
-                log_debug(f"[CONV3D CPU FALLBACK RESCUE] Mengalihkan Conv3D ke CPU secara selamat: {retry_err}...")
-                inp_c = input.cpu().contiguous()
-                w_c = weight.cpu().contiguous()
-                b_c = bias.cpu().contiguous() if (bias is not None and torch.is_tensor(bias)) else bias
-                res_c = _orig_conv3d(inp_c, w_c, bias=b_c, stride=stride, padding=padding, dilation=dilation, groups=groups)
-                return res_c.to(device=input.device, dtype=input.dtype)
-        raise conv_err
+                    safe_inp = input.contiguous() if torch.is_tensor(input) else input
+                    safe_w = weight.contiguous() if torch.is_tensor(weight) else weight
+                    safe_b = bias.contiguous() if (bias is not None and torch.is_tensor(bias)) else bias
+                    return orig_conv_fn(safe_inp, safe_w, bias=safe_b, *args, **kwargs)
 
-@functools.wraps(_orig_conv2d)
-def _resilient_conv2d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
-    input, weight, bias = _harmonize_conv_operands(input, weight, bias)
-    try:
-        return _orig_conv2d(input, weight, bias=bias, stride=stride, padding=padding, dilation=dilation, groups=groups)
-    except RuntimeError as conv_err:
-        err_s = str(conv_err).lower()
-        if "engine" in err_s or "cudnn" in err_s:
-            log_debug(f"[CUDNN RESCUE] cuDNN gagal mencari engine conv2d ({conv_err}). Mengaktifkan fallback PyTorch ATen native...")
-            with torch.backends.cudnn.flags(enabled=False):
-                safe_inp = input.contiguous() if torch.is_tensor(input) else input
-                safe_w = weight.contiguous() if torch.is_tensor(weight) else weight
-                safe_b = bias.contiguous() if (bias is not None and torch.is_tensor(bias)) else bias
-                return _orig_conv2d(safe_inp, safe_w, bias=safe_b, stride=stride, padding=padding, dilation=dilation, groups=groups)
+            if "type" in err_s or "device" in err_s or "should be the same" in err_s or "same device" in err_s or "contiguous" in err_s or "mismatch" in err_s:
+                log_debug(f"[{name.upper()} HARMONIZER RESCUE] Membetulkan ralat peranti/tipe {name}: {conv_err}. Menyelaras semula...")
+                target_dev = input.device if torch.is_tensor(input) else torch.device("cuda")
+                target_dt = input.dtype if torch.is_tensor(input) else torch.bfloat16
+                safe_inp = input.to(device=target_dev, dtype=target_dt).contiguous() if torch.is_tensor(input) else input
+                safe_w = weight.to(device=target_dev, dtype=target_dt).contiguous() if torch.is_tensor(weight) else weight
+                safe_b = bias.to(device=target_dev, dtype=target_dt).contiguous() if (bias is not None and torch.is_tensor(bias)) else bias
+                try:
+                    with torch.backends.cudnn.flags(enabled=False):
+                        return orig_conv_fn(safe_inp, safe_w, bias=safe_b, *args, **kwargs)
+                except Exception as retry_err:
+                    log_debug(f"[{name.upper()} CPU FALLBACK RESCUE] Mengalihkan {name} ke CPU secara selamat: {retry_err}...")
+                    inp_c = input.cpu().contiguous()
+                    w_c = weight.cpu().contiguous()
+                    b_c = bias.cpu().contiguous() if (bias is not None and torch.is_tensor(bias)) else bias
+                    res_c = orig_conv_fn(inp_c, w_c, bias=b_c, *args, **kwargs)
+                    return res_c.to(device=input.device, dtype=input.dtype)
+            raise conv_err
+    return _resilient_wrapper
 
-        if "type" in err_s or "device" in err_s or "should be the same" in err_s or "same device" in err_s or "contiguous" in err_s or "mismatch" in err_s:
-            log_debug(f"[CONV2D HARMONIZER RESCUE] Membetulkan ralat peranti/tipe Conv2D: {conv_err}. Menyelaras semula...")
-            target_dev = input.device if torch.is_tensor(input) else torch.device("cuda")
-            target_dt = input.dtype if torch.is_tensor(input) else torch.bfloat16
-            safe_inp = input.to(device=target_dev, dtype=target_dt).contiguous() if torch.is_tensor(input) else input
-            safe_w = weight.to(device=target_dev, dtype=target_dt).contiguous() if torch.is_tensor(weight) else weight
-            safe_b = bias.to(device=target_dev, dtype=target_dt).contiguous() if (bias is not None and torch.is_tensor(bias)) else bias
-            try:
-                with torch.backends.cudnn.flags(enabled=False):
-                    return _orig_conv2d(safe_inp, safe_w, bias=safe_b, stride=stride, padding=padding, dilation=dilation, groups=groups)
-            except Exception as retry_err:
-                log_debug(f"[CONV2D CPU FALLBACK RESCUE] Mengalihkan Conv2D ke CPU secara selamat: {retry_err}...")
-                inp_c = input.cpu().contiguous()
-                w_c = weight.cpu().contiguous()
-                b_c = bias.cpu().contiguous() if (bias is not None and torch.is_tensor(bias)) else bias
-                res_c = _orig_conv2d(inp_c, w_c, bias=b_c, stride=stride, padding=padding, dilation=dilation, groups=groups)
-                return res_c.to(device=input.device, dtype=input.dtype)
-        raise conv_err
-
-torch.nn.functional.conv3d = _resilient_conv3d
-torch.nn.functional.conv2d = _resilient_conv2d
-log_debug("Perisai Sejagat Resilient Conv3D & Conv2D (cuDNN Blackwell Engine Fallback & Universal Device Harmonizer Guard) berjaya dipasang.")
+torch.nn.functional.conv1d = _make_resilient_conv(_orig_conv1d, "conv1d")
+torch.nn.functional.conv2d = _make_resilient_conv(_orig_conv2d, "conv2d")
+torch.nn.functional.conv3d = _make_resilient_conv(_orig_conv3d, "conv3d")
+torch.nn.functional.conv_transpose1d = _make_resilient_conv(_orig_conv_transpose1d, "conv_transpose1d")
+torch.nn.functional.conv_transpose2d = _make_resilient_conv(_orig_conv_transpose2d, "conv_transpose2d")
+torch.nn.functional.conv_transpose3d = _make_resilient_conv(_orig_conv_transpose3d, "conv_transpose3d")
+log_debug("Perisai Sejagat Resilient Convolutions (1D/2D/3D & Transposed 1D/2D/3D cuDNN Fallback & Device Harmonizer) berjaya dipasang.")
 
 # ==========================================================================
 # Perisai Sejagat LayerNorm & GroupNorm (Universal Device/Dtype Harmonizer)
@@ -1313,6 +1314,80 @@ def _safe_group_norm(input, num_groups, weight=None, bias=None, eps=1e-5):
 torch.nn.functional.layer_norm = _safe_layer_norm
 torch.nn.functional.group_norm = _safe_group_norm
 log_debug("Perisai Sejagat LayerNorm & GroupNorm (Universal Device/Dtype Harmonizer Guard) berjaya dipasang.")
+
+# ==========================================================================
+# Perisai Sejagat Embedding, SDPA, & Interpolate (Universal Device/Dtype Harmonizer)
+# Menyelesaikan mismatch peranti embedding, attention SDPA, dan CPU bfloat16 interpolate
+# ==========================================================================
+_orig_embedding = torch.nn.functional.embedding
+_orig_sdpa = torch.nn.functional.scaled_dot_product_attention
+_orig_interpolate = torch.nn.functional.interpolate
+
+@functools.wraps(_orig_embedding)
+def _safe_embedding(input, weight, padding_idx=None, max_norm=None, norm_type=2.0, scale_grad_by_freq=False, sparse=False):
+    if torch.is_tensor(input) and torch.is_tensor(weight):
+        if input.device != weight.device:
+            input = input.to(device=weight.device)
+    try:
+        return _orig_embedding(input, weight, padding_idx=padding_idx, max_norm=max_norm, norm_type=norm_type, scale_grad_by_freq=scale_grad_by_freq, sparse=sparse)
+    except Exception as emb_err:
+        err_s = str(emb_err).lower()
+        if "device" in err_s or "same" in err_s:
+            input = input.to(device=weight.device)
+            return _orig_embedding(input, weight, padding_idx=padding_idx, max_norm=max_norm, norm_type=norm_type, scale_grad_by_freq=scale_grad_by_freq, sparse=sparse)
+        raise emb_err
+
+@functools.wraps(_orig_sdpa)
+def _safe_sdpa(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, enable_gqa=False):
+    if torch.is_tensor(query):
+        target_dev = query.device
+        target_dt = query.dtype
+        if torch.is_tensor(key) and (key.device != target_dev or key.dtype != target_dt):
+            key = key.to(device=target_dev, dtype=target_dt)
+        if torch.is_tensor(value) and (value.device != target_dev or value.dtype != target_dt):
+            value = value.to(device=target_dev, dtype=target_dt)
+        if attn_mask is not None and torch.is_tensor(attn_mask) and attn_mask.device != target_dev:
+            attn_mask = attn_mask.to(device=target_dev)
+    try:
+        if enable_gqa:
+            return _orig_sdpa(query, key, value, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal, scale=scale, enable_gqa=enable_gqa)
+        else:
+            return _orig_sdpa(query, key, value, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal, scale=scale)
+    except Exception as sdpa_err:
+        err_s = str(sdpa_err).lower()
+        if "device" in err_s or "dtype" in err_s or "type" in err_s:
+            log_debug(f"[SDPA RESCUE] Menyelaras semula input SDPA: {sdpa_err}...")
+            target_dev = query.device
+            target_dt = query.dtype
+            k = key.to(device=target_dev, dtype=target_dt) if torch.is_tensor(key) else key
+            v = value.to(device=target_dev, dtype=target_dt) if torch.is_tensor(value) else value
+            m = attn_mask.to(device=target_dev) if (attn_mask is not None and torch.is_tensor(attn_mask)) else attn_mask
+            if enable_gqa:
+                return _orig_sdpa(query, k, v, attn_mask=m, dropout_p=dropout_p, is_causal=is_causal, scale=scale, enable_gqa=enable_gqa)
+            return _orig_sdpa(query, k, v, attn_mask=m, dropout_p=dropout_p, is_causal=is_causal, scale=scale)
+        raise sdpa_err
+
+@functools.wraps(_orig_interpolate)
+def _safe_interpolate(input, size=None, scale_factor=None, mode='nearest', align_corners=None, recompute_scale_factor=None, antialias=False):
+    if torch.is_tensor(input) and input.device.type == "cpu" and input.dtype in (torch.bfloat16, torch.float16):
+        orig_dt = input.dtype
+        res = _orig_interpolate(input.float(), size=size, scale_factor=scale_factor, mode=mode, align_corners=align_corners, recompute_scale_factor=recompute_scale_factor, antialias=antialias)
+        return res.to(dtype=orig_dt)
+    try:
+        return _orig_interpolate(input, size=size, scale_factor=scale_factor, mode=mode, align_corners=align_corners, recompute_scale_factor=recompute_scale_factor, antialias=antialias)
+    except Exception as int_err:
+        err_s = str(int_err).lower()
+        if "not implemented" in err_s or "bfloat16" in err_s or "half" in err_s:
+            orig_dt = input.dtype
+            res = _orig_interpolate(input.float(), size=size, scale_factor=scale_factor, mode=mode, align_corners=align_corners, recompute_scale_factor=recompute_scale_factor, antialias=antialias)
+            return res.to(dtype=orig_dt)
+        raise int_err
+
+torch.nn.functional.embedding = _safe_embedding
+torch.nn.functional.scaled_dot_product_attention = _safe_sdpa
+torch.nn.functional.interpolate = _safe_interpolate
+log_debug("Perisai Sejagat Embedding, SDPA, & Interpolate (Universal Device/Dtype Harmonizer Guard) berjaya dipasang.")
+
 
 # Pintasan GGUF Proaktif Sejagat: Menapis Berdasarkan Nisbah Lonjakan Memori Fizikal Masa-Nyata
 try:
