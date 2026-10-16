@@ -1729,10 +1729,11 @@ def compute_dynamic_transformer_budget(transformer_module=None, is_async=True, p
             attn_out_mb = float((total_tokens * inner_dim * elem_size) / (1024 * 1024))
             # 3. Penimbal residual x:
             residual_mb = float((total_tokens * hidden_dim * elem_size) / (1024 * 1024))
-            # 4. Penimbal chunk kerja sementara unjuran QKV (maksimum 1 chunk 8192 token):
-            chunk_work_mb = min(512.0, float((min(total_tokens, 8192) * 3 * inner_dim * elem_size) / (1024 * 1024)))
-            # 5. Penimbal enjin attention workspace (SageAttention 2 SM120 / SDPA):
-            engine_mb = min(384.0, float((total_tokens * inner_dim * elem_size * 0.5) / (1024 * 1024)))
+            # 4. Penimbal chunk kerja sementara unjuran QKV (dinamik mengikut saiz token dan had alokasi selamat GPU):
+            dyn_chunk_tokens = total_tokens if total_tokens <= 4096 else math.ceil(total_tokens / max(2, math.ceil((total_tokens * row_bytes) / max(1, (total_gpu_mb * 1048576) * 0.08))))
+            chunk_work_mb = float((dyn_chunk_tokens * (3 if has_combined_qkv else 1) * inner_dim * elem_size) / (1024 * 1024))
+            # 5. Penimbal enjin attention workspace (SageAttention 2 SM120 natif tanpa matrik N*N):
+            engine_mb = float((total_tokens * inner_dim * elem_size * 0.25) / (1024 * 1024))
             
             # Puncak serentak DiTBlock attention sebenar (mengelakkan anggaran 7GB melampau yang melumpuhkan muatan blok):
             dit_peak_act_mb = dest_qkv_mb + attn_out_mb + chunk_work_mb + residual_mb + engine_mb
