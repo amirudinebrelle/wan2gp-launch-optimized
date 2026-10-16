@@ -1705,7 +1705,7 @@ def centralized_model_memory_arbiter(
         log_debug(
             f"[ARBITER PUSAT] Role={model_role}, Tokens={tokens}, Blok={effective_block_mb:.1f}MB, Base={base_size_mb:.1f}MB: "
             f"GPU={total_gpu_mb:.0f}MB, Free={free_mb:.0f}MB, Live={active_live_mb:.0f}MB, ActPeak={act_peak_mb:.0f}MB, "
-            f"Overhead={total_deductions_mb - usable_mb:.0f}MB -> Bajet={safe_budget_mb}MB ({mode_str}), Headroom={vram_headroom_mb:.0f}MB."
+            f"Overhead={total_deductions_mb:.0f}MB, Usable={usable_mb:.0f}MB -> Bajet={safe_budget_mb}MB ({mode_str}), Headroom={vram_headroom_mb:.0f}MB."
         )
 
         return {
