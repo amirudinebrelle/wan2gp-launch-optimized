@@ -310,21 +310,27 @@ def evict_h3_auxiliary_modules(container):
     evicted_total = 0
     try:
         active_inst = get_active_mmgp_instance()
-        for mod_id in ("video_encoder", "vae", "audio_vae", "latent_upscaler", "text_encoder", "vision_encoder"):
+        for mod_id in ("video_encoder", "vae", "audio_vae", "latent_upscaler"):
             if active_inst is not None:
                 try:
                     safe_mmgp_unload(active_inst, mod_id)
                     evicted_total += 1
                 except Exception:
                     pass
-            subm = getattr(container, mod_id, None)
-            if subm is not None and hasattr(subm, "to"):
-                try:
-                    subm.to("cpu")
-                except Exception:
-                    pass
+        # Untuk text_encoder: HANYA alihkan embed_tokens.weight jika ia berada di CUDA!
+        # JANGAN panggil .to("cpu") ke atas keseluruhan model 32B (GGUF mmap) yang menyebabkan sangkut/freeze.
+        te = getattr(container, "text_encoder", None)
+        if te is not None:
+            lm = getattr(te, "language_model", None)
+            if lm is not None and hasattr(lm, "embed_tokens"):
+                et = lm.embed_tokens
+                if hasattr(et, "weight") and et.weight is not None and et.weight.is_cuda:
+                    try:
+                        et.to("cpu")
+                        evicted_total += 1
+                    except Exception:
+                        pass
         flush_vram()
-        trim_current_process_working_set()
         if evicted_total > 0:
             log_debug(f"[OFFLOAD PEMBANTU] Modul pembantu dipunggah bersih menerusi MMGP (VRAM 100% bebas untuk Transformer).")
     except Exception as ex:
@@ -737,7 +743,6 @@ def safe_mmgp_unload(active_instance, target_key):
                 release_ram_cache()
             except Exception:
                 pass
-            trim_current_process_working_set()
             return
 
         if "/" in target_key:
@@ -772,7 +777,6 @@ def safe_mmgp_unload(active_instance, target_key):
                     mmgp_ram.release()
                 except Exception:
                     pass
-                trim_current_process_working_set()
     except Exception as e:
         log_debug(f"Pengecualian semasa safe_mmgp_unload: {e}")
 
@@ -1750,6 +1754,7 @@ def compute_dynamic_transformer_budget(transformer_module=None, is_async=True, p
             # 3. Penimbal residual x:
             residual_mb = float((total_tokens * hidden_dim * elem_size) / (1024 * 1024))
             # 4. Penimbal chunk kerja sementara unjuran QKV (dinamik mengikut saiz token dan had alokasi selamat GPU):
+            row_bytes = int((3 if has_combined_qkv else 1) * inner_dim * elem_size)
             dyn_chunk_tokens = total_tokens if total_tokens <= 4096 else math.ceil(total_tokens / max(2, math.ceil((total_tokens * row_bytes) / max(1, (total_gpu_mb * 1048576) * 0.08))))
             chunk_work_mb = float((dyn_chunk_tokens * (3 if has_combined_qkv else 1) * inner_dim * elem_size) / (1024 * 1024))
             # 5. Penimbal enjin attention workspace (SageAttention 2 SM120 natif tanpa matrik N*N):
@@ -3963,16 +3968,8 @@ try:
                 self._in_transformer_phase = True
                 _orig_use_trans(self)
                 try:
-                    # 1. On-Demand Lembut: Nyahmuat text_encoder & vision_encoder dari VRAM sepenuhnya
                     active_inst = get_active_mmgp_instance()
-                    if active_inst is not None:
-                        for mid in ("text_encoder", "vision_encoder"):
-                            safe_mmgp_unload(active_inst, mid)
-                            m_entry = active_inst.models.get(mid)
-                            if m_entry is not None:
-                                setattr(m_entry, "_pinned_bytes", 0)
-
-                    # 2. Nyahmuat semua modul dorman bukan transformer secara dinamik (Zero Hardcoding)
+                    # 1. Nyahmuat semua modul dorman bukan transformer secara dinamik (Zero Hardcoding)
                     if active_inst is not None:
                         for mid in list(active_inst.models.keys()):
                             if "transformer" not in str(mid).lower():
@@ -3981,7 +3978,7 @@ try:
                                 if m_entry is not None:
                                     setattr(m_entry, "_pinned_bytes", 0)
 
-                    # True On-Demand Disk-to-RAM: Singkirkan bobot 4 modul pembantu (Video VAE, Video Encoder, Audio VAE, Latent Upscaler) ke Disk
+                    # 2. Singkirkan bobot modul pembantu & pindahkan embed_tokens ke CPU secara terpilih (Zero Freeze)
                     evict_h3_auxiliary_modules(self)
 
                     flush_vram()
@@ -4004,11 +4001,7 @@ try:
                     except Exception:
                         pass
 
-                    # 4. Lucutkan serta-merta 14GB halaman mmap Qwen Text Encoder daripada RAM fizikal proses (0.25 ms)
-                    force_pagefile_push(force_trim=False)
-                    trim_current_process_working_set()
-
-                    # 5. Tala semula bajet VRAM transformer secara fizik masa-nyata mengikut mod aktif (Audio vs Video)
+                    # 4. Tala semula bajet VRAM transformer secara fizik masa-nyata mengikut mod aktif (Audio vs Video)
                     if active_inst is not None:
                         is_audio = getattr(self, "audio_only", False)
                         is_ref_mode = getattr(self, "reference_mode", False)
@@ -4018,13 +4011,12 @@ try:
                         cur_h = getattr(self, "_current_height", None)
                         cur_w = getattr(self, "_current_width", None)
                         cur_fn = getattr(self, "_current_frame_num", None)
-                        # Nisbah modaliti visual fizikal: 2.0 saluran bagi mod rujukan/sambung video (target + rujukan)
                         channel_ratio = 2.0 if is_ref_mode else 1.0
                         retune_active_model_dynamically(active_inst, phase=1, token_scaling_ratio=channel_ratio, is_audio_only=is_audio, height=cur_h, width=cur_w, frame_num=cur_fn)
 
-                    # 6. Laporan Telemetri RAM Masa-Nyata Telus
+                    # 5. Laporan Telemetri RAM Masa-Nyata Telus
                     mem = psutil.virtual_memory()
-                    log_debug(f"[MINIMAX H3 LIFECYCLE] Fasa 1 (Encoding) selesai -> Qwen Text Encoder dilucutkan daripada RAM fizikal (On-Demand MMap). Status RAM Hos: {mem.used/(1024**3):.2f} GB / {mem.total/(1024**3):.2f} GB ({mem.percent:.1f}%) | Bebas: {mem.available/(1024**3):.2f} GB. Gelung Denoising sedia berjalan pantas (2.7s/blok).")
+                    log_debug(f"[MINIMAX H3 LIFECYCLE] Fasa 1 (Encoding) selesai -> Modul pembantu dinyahmuat. RAM Hos: {mem.used/(1024**3):.2f} GB / {mem.total/(1024**3):.2f} GB ({mem.percent:.1f}%) | Bebas: {mem.available/(1024**3):.2f} GB. Gelung Denoising sedia berjalan pantas.")
                 except Exception as ex:
                     log_debug(f"[MINIMAX H3 LIFECYCLE] Ralat pelepasan Fasa 1: {ex}")
 
@@ -5342,11 +5334,21 @@ def main():
                                 cache_o.clear()
                     for comp_name in ("text_encoder", "vision_encoder", "video_encoder", "vae", "audio_vae", "latent_upscaler"):
                         comp = getattr(wm, comp_name, None)
-                        if comp is not None and hasattr(comp, "to"):
-                            try:
-                                comp.to("cpu")
-                            except Exception:
-                                pass
+                        if comp is not None:
+                            if comp_name == "text_encoder":
+                                lm = getattr(comp, "language_model", None)
+                                if lm is not None and hasattr(lm, "embed_tokens"):
+                                    et = lm.embed_tokens
+                                    if hasattr(et, "weight") and et.weight is not None and et.weight.is_cuda:
+                                        try:
+                                            et.to("cpu")
+                                        except Exception:
+                                            pass
+                            elif hasattr(comp, "to"):
+                                try:
+                                    comp.to("cpu")
+                                except Exception:
+                                    pass
             except Exception:
                 pass
 
