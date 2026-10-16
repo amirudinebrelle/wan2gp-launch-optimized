@@ -1131,11 +1131,53 @@ def _safe_embedding(input, weight, padding_idx=None, max_norm=None, norm_type=2.
 
 torch.nn.functional.embedding = _safe_embedding
 
-# Perisai Sejagat Resilient Conv3D (cuDNN Blackwell Engine Fallback Guard)
-# Menyelesaikan ralat 'RuntimeError: GET was unable to find an engine to execute this computation'
+# ==========================================================================
+# Perisai Sejagat Resilient Conv (cuDNN Blackwell Fallback & Universal Device/Dtype Harmonizer)
+# Menyelesaikan ralat:
+# 1. 'RuntimeError: GET was unable to find an engine to execute this computation'
+# 2. 'RuntimeError: Input type (CUDABFloat16Type) and weight type (CPUBFloat16Type) should be the same'
+# 3. 'RuntimeError: Expected all tensors to be on the same device'
+# ==========================================================================
 _orig_conv3d = torch.nn.functional.conv3d
+_orig_conv2d = torch.nn.functional.conv2d
+_orig_conv1d = torch.nn.functional.conv1d
+
+def _harmonize_conv_operands(input, weight, bias=None):
+    if not (torch.is_tensor(input) and torch.is_tensor(weight)):
+        return input, weight, bias
+    target_device = input.device
+    target_dtype = input.dtype
+
+    # 1. Penyelarasan Peranti (Device Auto-Harmonize)
+    if weight.device != target_device:
+        try:
+            weight = weight.to(device=target_device)
+        except Exception:
+            target_device = weight.device
+            input = input.to(device=target_device)
+
+    # 2. Penyelarasan Jenis Data (Dtype Auto-Harmonize)
+    if weight.dtype != target_dtype:
+        if weight.dtype.is_floating_point and target_dtype.is_floating_point:
+            try:
+                weight = weight.to(dtype=target_dtype)
+            except Exception:
+                input = input.to(dtype=weight.dtype)
+                target_dtype = weight.dtype
+
+    # 3. Penyelarasan Penimbal Bias
+    if bias is not None and torch.is_tensor(bias):
+        if bias.device != target_device or bias.dtype != target_dtype:
+            try:
+                bias = bias.to(device=target_device, dtype=target_dtype)
+            except Exception:
+                pass
+
+    return input, weight, bias
+
 @functools.wraps(_orig_conv3d)
 def _resilient_conv3d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
+    input, weight, bias = _harmonize_conv_operands(input, weight, bias)
     try:
         return _orig_conv3d(input, weight, bias=bias, stride=stride, padding=padding, dilation=dilation, groups=groups)
     except RuntimeError as conv_err:
@@ -1145,10 +1187,65 @@ def _resilient_conv3d(input, weight, bias=None, stride=1, padding=0, dilation=1,
             with torch.backends.cudnn.flags(enabled=False):
                 safe_inp = input.contiguous() if torch.is_tensor(input) else input
                 safe_w = weight.contiguous() if torch.is_tensor(weight) else weight
-                return _orig_conv3d(safe_inp, safe_w, bias=bias, stride=stride, padding=padding, dilation=dilation, groups=groups)
+                safe_b = bias.contiguous() if (bias is not None and torch.is_tensor(bias)) else bias
+                return _orig_conv3d(safe_inp, safe_w, bias=safe_b, stride=stride, padding=padding, dilation=dilation, groups=groups)
+
+        if "type" in err_s or "device" in err_s or "should be the same" in err_s or "same device" in err_s or "contiguous" in err_s or "mismatch" in err_s:
+            log_debug(f"[CONV3D HARMONIZER RESCUE] Membetulkan ralat peranti/tipe Conv3D: {conv_err}. Menyelaras semula...")
+            target_dev = input.device if torch.is_tensor(input) else torch.device("cuda")
+            target_dt = input.dtype if torch.is_tensor(input) else torch.bfloat16
+            safe_inp = input.to(device=target_dev, dtype=target_dt).contiguous() if torch.is_tensor(input) else input
+            safe_w = weight.to(device=target_dev, dtype=target_dt).contiguous() if torch.is_tensor(weight) else weight
+            safe_b = bias.to(device=target_dev, dtype=target_dt).contiguous() if (bias is not None and torch.is_tensor(bias)) else bias
+            try:
+                with torch.backends.cudnn.flags(enabled=False):
+                    return _orig_conv3d(safe_inp, safe_w, bias=safe_b, stride=stride, padding=padding, dilation=dilation, groups=groups)
+            except Exception as retry_err:
+                log_debug(f"[CONV3D CPU FALLBACK RESCUE] Mengalihkan Conv3D ke CPU secara selamat: {retry_err}...")
+                inp_c = input.cpu().contiguous()
+                w_c = weight.cpu().contiguous()
+                b_c = bias.cpu().contiguous() if (bias is not None and torch.is_tensor(bias)) else bias
+                res_c = _orig_conv3d(inp_c, w_c, bias=b_c, stride=stride, padding=padding, dilation=dilation, groups=groups)
+                return res_c.to(device=input.device, dtype=input.dtype)
         raise conv_err
+
+@functools.wraps(_orig_conv2d)
+def _resilient_conv2d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
+    input, weight, bias = _harmonize_conv_operands(input, weight, bias)
+    try:
+        return _orig_conv2d(input, weight, bias=bias, stride=stride, padding=padding, dilation=dilation, groups=groups)
+    except RuntimeError as conv_err:
+        err_s = str(conv_err).lower()
+        if "engine" in err_s or "cudnn" in err_s:
+            log_debug(f"[CUDNN RESCUE] cuDNN gagal mencari engine conv2d ({conv_err}). Mengaktifkan fallback PyTorch ATen native...")
+            with torch.backends.cudnn.flags(enabled=False):
+                safe_inp = input.contiguous() if torch.is_tensor(input) else input
+                safe_w = weight.contiguous() if torch.is_tensor(weight) else weight
+                safe_b = bias.contiguous() if (bias is not None and torch.is_tensor(bias)) else bias
+                return _orig_conv2d(safe_inp, safe_w, bias=safe_b, stride=stride, padding=padding, dilation=dilation, groups=groups)
+
+        if "type" in err_s or "device" in err_s or "should be the same" in err_s or "same device" in err_s or "contiguous" in err_s or "mismatch" in err_s:
+            log_debug(f"[CONV2D HARMONIZER RESCUE] Membetulkan ralat peranti/tipe Conv2D: {conv_err}. Menyelaras semula...")
+            target_dev = input.device if torch.is_tensor(input) else torch.device("cuda")
+            target_dt = input.dtype if torch.is_tensor(input) else torch.bfloat16
+            safe_inp = input.to(device=target_dev, dtype=target_dt).contiguous() if torch.is_tensor(input) else input
+            safe_w = weight.to(device=target_dev, dtype=target_dt).contiguous() if torch.is_tensor(weight) else weight
+            safe_b = bias.to(device=target_dev, dtype=target_dt).contiguous() if (bias is not None and torch.is_tensor(bias)) else bias
+            try:
+                with torch.backends.cudnn.flags(enabled=False):
+                    return _orig_conv2d(safe_inp, safe_w, bias=safe_b, stride=stride, padding=padding, dilation=dilation, groups=groups)
+            except Exception as retry_err:
+                log_debug(f"[CONV2D CPU FALLBACK RESCUE] Mengalihkan Conv2D ke CPU secara selamat: {retry_err}...")
+                inp_c = input.cpu().contiguous()
+                w_c = weight.cpu().contiguous()
+                b_c = bias.cpu().contiguous() if (bias is not None and torch.is_tensor(bias)) else bias
+                res_c = _orig_conv2d(inp_c, w_c, bias=b_c, stride=stride, padding=padding, dilation=dilation, groups=groups)
+                return res_c.to(device=input.device, dtype=input.dtype)
+        raise conv_err
+
 torch.nn.functional.conv3d = _resilient_conv3d
-log_debug("Perisai Sejagat Resilient Conv3D (cuDNN Blackwell Engine Fallback Guard) berjaya dipasang.")
+torch.nn.functional.conv2d = _resilient_conv2d
+log_debug("Perisai Sejagat Resilient Conv3D & Conv2D (cuDNN Blackwell Engine Fallback & Universal Device Harmonizer Guard) berjaya dipasang.")
 
 # Pintasan GGUF Proaktif Sejagat: Menapis Berdasarkan Nisbah Lonjakan Memori Fizikal Masa-Nyata
 try:
@@ -4273,10 +4370,10 @@ try:
                     _h3_persistent_kv["attn_out"] = None
 
                     # Selaraskan pelepasan fasa 2 secara terpusat melalui Pengurus Kitaran Hayat Sejagat
-                    CentralizedUniversalLifecycleManager.get_instance().transition_to_phase("PHASE_3_DECODE", pipeline=self)
-
+                    # PENTING: Hanya beralih ke PHASE_3_DECODE sekiranya proses Denoising (Fasa 2) sememangnya telah aktif!
                     if getattr(self, "_in_transformer_phase", False):
                         self._in_transformer_phase = False
+                        CentralizedUniversalLifecycleManager.get_instance().transition_to_phase("PHASE_3_DECODE", pipeline=self)
                         # KONTINUUM PEMULIHAN (SSD LATENT CHECKPOINT DUMP):
                         try:
                             import sys
@@ -4310,7 +4407,15 @@ try:
 
             def _smart_generate(self, *args, **kwargs):
                 self._in_transformer_phase = False
+                CentralizedUniversalLifecycleManager.get_instance().current_phase = "PHASE_1_ENCODE"
                 try:
+                    # Selaraskan submodul visual Text Encoder ke self.device secara proaktif jika ada
+                    if hasattr(self, "text_encoder") and self.text_encoder is not None:
+                        if hasattr(self.text_encoder, "visual") and self.text_encoder.visual is not None:
+                            try:
+                                self.text_encoder.visual.to(device=self.device)
+                            except Exception:
+                                pass
                     # Semak jika text_encoder perlu dimuatkan semula secara On-Demand untuk penjanaan baharu
                     if getattr(self, "_text_encoder_needs_reload", False) or getattr(self, "text_encoder", None) is None:
                         try:
@@ -4454,8 +4559,31 @@ try:
                             new_kwargs.pop("audio_prompt", None)
                             new_kwargs.pop("ref_audio", None)
                             res = _orig_generate(self, *args, **new_kwargs)
+                        elif "type" in gen_err_str or "device" in gen_err_str or "should be the same" in gen_err_str or "same device" in gen_err_str:
+                            log_debug("[UNIVERSAL PIPELINE RESCUE] Mengesan ketidakpadanan peranti/tipe. Menyelaras semua modul aktif ke CUDA dan mencuba semula...")
+                            try:
+                                if hasattr(self, "text_encoder") and self.text_encoder is not None:
+                                    if hasattr(self.text_encoder, "visual") and self.text_encoder.visual is not None:
+                                        self.text_encoder.visual.to(device=self.device)
+                                res = _orig_generate(self, *args, **kwargs)
+                            except Exception as retry_err2:
+                                log_debug(f"[UNIVERSAL PIPELINE RESCUE] Percubaan semula gagal ({retry_err2}). Meneruskan mod selamat tanpa audio...")
+                                new_kwargs = dict(kwargs)
+                                new_kwargs.pop("audio", None)
+                                res = _orig_generate(self, *args, **new_kwargs)
+                        elif "out of memory" in gen_err_str or "cuda" in gen_err_str:
+                            log_debug("[UNIVERSAL PIPELINE RESCUE] Mengesan kekangan memori CUDA. Mengosongkan penimbal dan mencuba semula...")
+                            flush_vram()
+                            res = _orig_generate(self, *args, **kwargs)
                         else:
-                            raise gen_err
+                            log_debug(f"[UNIVERSAL PIPELINE RESCUE] Melaksanakan auto-pelarasan kecemasan: {gen_err}")
+                            try:
+                                new_kwargs = dict(kwargs)
+                                new_kwargs.pop("audio", None)
+                                new_kwargs.pop("ref_audio", None)
+                                res = _orig_generate(self, *args, **new_kwargs)
+                            except Exception:
+                                raise gen_err
                     try:
                         if os.path.exists(recovery_path):
                             os.remove(recovery_path)
@@ -5371,7 +5499,7 @@ try:
         mod = _orig_import_module_ltx(name, package)
         if name == "models.ltx2.ltx2_handler":
             try:
-                if not getattr(mod, "_smart_connector_patched", False):
+                if not getattr(mod, "_smart_connector_patched", False) and hasattr(mod, "_get_ltx25_connector_variant"):
                     _orig_get_variant = mod._get_ltx25_connector_variant
                     def _smart_get_ltx25_connector_variant(transformer_path):
                         transformer_name = os.path.basename(transformer_path or "").lower()
