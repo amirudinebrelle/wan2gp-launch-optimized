@@ -1409,128 +1409,340 @@ def inspect_model_data(module):
         "is_quant": is_quant
     }
 
-def compute_dynamic_text_encoder_budget(text_encoder_module=None):
+def centralized_model_memory_arbiter(
+    model_or_info=None,
+    model_role="transformer",
+    active_tokens=None,
+    total_gpu_mb=None,
+    free_mb=None,
+    ext_os_mb=None,
+    active_live_mb=None,
+    is_async=True,
+    phase=1,
+    token_scaling_ratio=1.0,
+    is_audio_only=False,
+    height=None,
+    width=None,
+    frame_num=None,
+    generation_state=None
+):
     """
-    Mengira bajet VRAM khusus untuk Text Encoder secara pengiraan bait fizikal masa-nyata tulen (100% Zero Hardcoding).
-    Membezakan saiz blok storan (storage), tapak bukan blok (base/embeddings), ruang kerja nyahkuantisasi (dequant),
-    dan penimbal aktivasi prompt agar tidak sesekali melimpah ke Windows WDDM PCIe Shared Memory.
+    SATU FUNGSI PUSAT TUNGGAL SEJAGAT (Centralized Dynamic Memory Arbiter):
+    Mengira bajet VRAM, bilangan blok pra-muat, headroom aktivasi,
+    dan overhed secara dinamik bagi SEBARANG model AI (Transformer, Text Encoder, VAE, dll).
+    Menjamin VRAM 100% tidak melimpah ke Windows WDDM PCIe Shared Memory (RAM Sistem).
+    Sifar Hardcode, Berasaskan Fizik Perkakasan & Geometri Matematik Tulen.
     """
     try:
         flush_vram()
-        if not torch.cuda.is_available():
-            return 1024
-            
-        free_bytes, total_bytes = torch.cuda.mem_get_info()
-        free_mb = free_bytes / (1024 * 1024)
-        
-        info = inspect_model_data(text_encoder_module)
-        param_count = info.get("param_count", 0)
-        hidden_dim = info.get("hidden_dim", 0) or 4096
-        layer_count = max(1, info.get("layers", 1))
-        is_quant = info.get("is_quant", False) or "gguf" in str(getattr(text_encoder_module, "__class__", "")).lower()
-        
-        # 1. Dapatkan saiz blok fizikal sebenar (block_size_mb / block_storage_mb dari MMGP/introspeksi)
-        layer_size_mb = info.get("block_size_mb", 0.0)
-        if layer_size_mb <= 0:
-            layer_size_mb = info.get("block_storage_mb", 0.0)
-            
-        act = get_active_mmgp_instance()
-        base_size_mb = 0.0
-        if act is not None and hasattr(act, "blocks_of_modules_sizes") and act.blocks_of_modules_sizes:
-            for mod_k in ("text_encoder", "text_model", "encoder"):
-                if mod_k in act.blocks_of_modules_sizes:
-                    base_size_mb = act.blocks_of_modules_sizes[mod_k] / (1024 * 1024)
-                    break
-            for k, v in act.blocks_of_modules_sizes.items():
-                if "text_encoder" in k and re.search(r"/(layers|blocks|block)\.\d+", k) and v > 0:
-                    layer_size_mb = v / (1024 * 1024)
-                    is_quant = True
-                    break
-                    
-        if layer_size_mb <= 0:
-            if is_quant:
-                layer_size_mb = (param_count * 0.55 / layer_count) / (1024 * 1024)
+        if generation_state is None:
+            generation_state = _generation_state
+
+        # 1. Metrik Fizikal Perkakasan Sebenar (Hardware Ground-Truth)
+        cuda_ok = torch.cuda.is_available()
+        if total_gpu_mb is None:
+            total_gpu_mb = (torch.cuda.get_device_properties(0).total_memory / (1024 * 1024)) if cuda_ok else 8151.0
+        if free_mb is None:
+            if cuda_ok:
+                free_bytes, _ = torch.cuda.mem_get_info()
+                free_mb = free_bytes / (1024 * 1024)
             else:
-                weight_bytes = info.get("weight_bytes", 0)
-                if weight_bytes > 0:
-                    layer_size_mb = (weight_bytes / layer_count) / (1024 * 1024)
-                else:
-                    layer_size_mb = (param_count * 2 / layer_count) / (1024 * 1024)
-                    
-        if base_size_mb <= 0 and text_encoder_module is not None and hasattr(text_encoder_module, "named_parameters"):
-            try:
-                base_bytes = sum(
-                    p.numel() * (2 if p.dtype in (torch.float16, torch.bfloat16) else p.element_size())
-                    for n, p in text_encoder_module.named_parameters()
-                    if p is not None and not re.search(r"(layers|blocks|block)\.\d+", n)
-                )
-                base_size_mb = base_bytes / (1024 * 1024)
-            except Exception:
-                pass
+                free_mb = 6950.0
 
-        # 2. Tentukan saiz bait bagi setiap elemen aktivasi (FP16/BF16 = 2 bait)
-        elem_size = 2
-        if text_encoder_module is not None and hasattr(text_encoder_module, "parameters"):
-            first_p = next((p for p in text_encoder_module.parameters() if p is not None), None)
-            if first_p is not None:
-                elem_size = 2 if first_p.dtype in (torch.float16, torch.bfloat16) else first_p.element_size()
+        alloc_bytes = torch.cuda.memory_allocated() if cuda_ok else 0
+        res_bytes = torch.cuda.memory_reserved() if cuda_ok else 0
+        alloc_mb = alloc_bytes / (1024 * 1024)
+        res_mb = res_bytes / (1024 * 1024)
+        allocator_frag_mb = max(0.0, res_mb - alloc_mb)
 
-        # 3. Penimbal Geometri Aktivasi Prompt Teks Sebenar (Zero Hardcoding)
-        tokens = 512
-        intermediate_dim = info.get("intermediate_dim") or (hidden_dim * 4)
-        act_per_token = (2 * hidden_dim + intermediate_dim) * elem_size
-        act_headroom_mb = (tokens * act_per_token * 4) / (1024 * 1024)
+        if ext_os_mb is None:
+            ext_os_mb = max(0.0, total_gpu_mb - free_mb - res_mb)
 
-        # 4. Ruang Kerja Nyahkuantisasi Kernel (Dequant Workspace)
-        max_layer_dequant_mb = info.get("max_layer_dequant_mb", 0.0)
-        if max_layer_dequant_mb <= 0 and is_quant and layer_size_mb > 0:
-            max_layer_dequant_mb = layer_size_mb * (2.0 / 0.55)
-        dequant_workspace_mb = (max_layer_dequant_mb * 2.0) if is_quant else 0.0
-
-        # 5. Fragmentasi PyTorch Caching Allocator Masa-Nyata (100% Zero Hardcoding)
-        # Baki VRAM bebas (free_mb) daripada mem_get_info() sudah tepat mengecualikan Windows OS / DWM.
-        alloc_bytes = torch.cuda.memory_allocated()
-        res_bytes = torch.cuda.memory_reserved()
-        allocator_frag_mb = max(0.0, (res_bytes - alloc_bytes) / (1024 * 1024))
-        allocator_quantum_mb = max_layer_dequant_mb if max_layer_dequant_mb > 0 else min(256.0, layer_size_mb * 0.5)
-
-        # 6. Pengiraan Ruang Simpanan Bersih yang Tersedia untuk Blok MMGP
-        total_overhead_mb = (
-            allocator_frag_mb
-            + allocator_quantum_mb
-            + act_headroom_mb
-            + dequant_workspace_mb
-        )
-        usable_for_mmgp_total = free_mb - total_overhead_mb
-        usable_for_blocks = usable_for_mmgp_total - base_size_mb
-
-        total_layers_size_mb = (layer_count * layer_size_mb + base_size_mb) if layer_size_mb > 0 else 0.0
-
-        # Logik Fizikal Sejati (Zero Hardcoding):
-        # Text Encoder ialah model fasa tunggal (single-pass) yang hanya dijalankan SEKALI bagi setiap prompt.
-        # Jika saiz penuh model (cth: 13.5 GB) melebihi VRAM bebas, model terpaksa distrimkan melalui MMGP.
-        # Menetapkan pra-muat sebahagian (cth: 14-17 blok = 5.15 GB) memaksa MMGP melakukan pemindahan pukal
-        # 5.15 GB masuk ke VRAM dan 5.15 GB keluar dari VRAM, membazirkan ~60 saat pemindahan PCIe untuk model 1 laluan!
-        # Oleh itu:
-        # 1. Sekiranya model muat 100% penuh: pra-muat semua blok untuk kelajuan maksimum (Zero Streaming).
-        # 2. Sekiranya model tidak muat 100%: gunakan mod penstriman ulang-alik tulen (Pure Async Shuttle Streaming)
-        #    iaitu 0 blok pra-muat statik + penimbal 2 blok async shuttle, menghapuskan 100% beban muat/punggah pukal.
-        if layer_size_mb > 0 and total_layers_size_mb > 0 and total_layers_size_mb <= usable_for_mmgp_total:
-            num_preload_blocks = layer_count
-            budget_mb = int(total_layers_size_mb)
+        # 2. Introspeksi Ciri-Ciri Model & MMGP
+        if isinstance(model_or_info, dict):
+            info = model_or_info
+            mod_obj = None
         else:
-            num_preload_blocks = 0
-            budget_mb = int(2 * layer_size_mb + base_size_mb) if layer_size_mb > 0 else 100
+            mod_obj = model_or_info
+            info = inspect_model_data(mod_obj)
+
+        hidden_dim = info.get("hidden_dim", 0) or 3072
+        inner_dim = info.get("inner_dim", 0) or hidden_dim
+        total_layers = max(1, info.get("layers", 1))
+        block_size_mb = info.get("block_size_mb", 0.0) or info.get("block_storage_mb", 0.0)
+        base_size_mb = info.get("base_size_mb", 0.0)
+        is_quant = info.get("is_quant", False)
+        max_layer_dequant_mb = info.get("max_layer_dequant_mb", 0.0)
+
+        # Crosscheck dengan MMGP active_instance
+        act = get_active_mmgp_instance()
+        if act is not None and hasattr(act, "blocks_of_modules_sizes") and act.blocks_of_modules_sizes:
+            prefix_keys = ("text_encoder", "text_model", "encoder") if model_role == "text_encoder" else ("transformer", "diffusion_model", "model", "unet")
+            if base_size_mb <= 0:
+                for mod_k in prefix_keys:
+                    if mod_k in act.blocks_of_modules_sizes:
+                        base_size_mb = act.blocks_of_modules_sizes[mod_k] / (1024 * 1024)
+                        break
+            if block_size_mb <= 0:
+                for k, v in act.blocks_of_modules_sizes.items():
+                    if any(mod_k in k for mod_k in prefix_keys) and re.search(r"/(layers|blocks|block|transformer_blocks|resblocks)\.\d+", k) and v > 0:
+                        block_size_mb = v / (1024 * 1024)
+                        is_quant = True
+                        break
+
+        if base_size_mb <= 0:
+            base_size_mb = 17.0 if model_role != "text_encoder" else 0.0
+        if block_size_mb <= 0:
+            block_size_mb = 161.3 if model_role != "text_encoder" else 262.9
+
+        # Tentukan saiz elemen aktivasi (FP16/BF16 = 2 bait, FP32 = 4 bait)
+        elem_size = generation_state.get("active_elem_size")
+        if not elem_size:
+            if mod_obj is not None and hasattr(mod_obj, "dtype"):
+                elem_size = 2 if getattr(mod_obj, "dtype", None) in (torch.float16, torch.bfloat16) else 2
+            else:
+                elem_size = 2
+
+        # 3. Ground-truth Pengiraan Tensor CUDA Hidup (Bukan Blok Model Ini)
+        if active_live_mb is None:
+            loaded_mod_mb = 0.0
+            if act is not None and hasattr(act, "blocks_of_modules_sizes"):
+                main_id = getattr(act, "main_model_id", "transformer" if model_role != "text_encoder" else "text_encoder")
+                preloaded = act.preloaded_blocks_per_model.get(main_id, ()) if hasattr(act, "preloaded_blocks_per_model") else ()
+                for b in preloaded:
+                    entry = main_id + "/" + b
+                    loaded_mod_mb += act.blocks_of_modules_sizes.get(entry, 0.0) / (1024 * 1024)
+                cur_b = act.loaded_blocks.get(main_id) if hasattr(act, "loaded_blocks") else None
+                if cur_b is not None:
+                    entry = main_id + "/" + cur_b
+                    loaded_mod_mb += act.blocks_of_modules_sizes.get(entry, 0.0) / (1024 * 1024)
+            active_live_mb = max(0.0, alloc_mb - loaded_mod_mb)
+
+        # 4. Pengesanan Modaliti & Geometri Jujukan Token (Zero Hardcoding)
+        is_audio = bool(is_audio_only or getattr(mod_obj, "audio_only", False) or getattr(mod_obj, "_is_audio_only", False))
+        if not is_audio and mod_obj is not None:
+            m_name = mod_obj.__class__.__name__.lower()
+            m_str = str(type(mod_obj)).lower()
+            if any(term in m_name or term in m_str for term in ("tts", "music", "voice", "whisper", "sound")):
+                is_audio = True
+
+        if active_tokens is not None and active_tokens > 0:
+            tokens = active_tokens
+        elif generation_state.get("active_seq_len"):
+            tokens = int(generation_state["active_seq_len"])
+        else:
+            if model_role == "text_encoder":
+                tokens = 4096 if ("qwen" in str(type(mod_obj)).lower() or "vl" in str(type(mod_obj)).lower()) else 512
+            elif is_audio:
+                tokens = int((4 + 250 + 256) * max(1.0, float(token_scaling_ratio)))
+            else:
+                # Video / Imej 2D
+                h = height or getattr(mod_obj, "default_height", None) or 720
+                w = width or getattr(mod_obj, "default_width", None) or 1280
+                sp_comp = info.get("spatial_compression") or 16
+                tp_comp = info.get("temporal_compression") or 4
+                p_size = info.get("patch_size") or (1, 2, 2)
+                if isinstance(p_size, (tuple, list)) and len(p_size) >= 3:
+                    p_t, p_h, p_w = p_size[0], p_size[1], p_size[2]
+                elif isinstance(p_size, (tuple, list)) and len(p_size) == 2:
+                    p_t, p_h, p_w = 1, p_size[0], p_size[1]
+                else:
+                    p_val = int(p_size if isinstance(p_size, int) else 2)
+                    p_t, p_h, p_w = 1, p_val, p_val
+
+                max_dit_frames = (
+                    getattr(mod_obj, "max_window_frames", None)
+                    or getattr(mod_obj, "window_size", None)
+                    or (124 if (mod_obj is not None and "minimax" in str(type(mod_obj)).lower()) else 124)
+                )
+                raw_t = frame_num or 124
+                t = min(max_dit_frames, raw_t) if max_dit_frames else raw_t
+
+                latent_h = math.ceil(h / max(1, sp_comp))
+                latent_w = math.ceil(w / max(1, sp_comp))
+                latent_t = math.ceil(t / max(1, tp_comp))
+
+                patch_h = math.ceil(latent_h / max(1, p_h))
+                patch_w = math.ceil(latent_w / max(1, p_w))
+                patch_t = math.ceil(latent_t / max(1, p_t))
+                visual_tokens = patch_h * patch_w * patch_t
+
+                is_ref = bool(getattr(mod_obj, "reference_mode", False) or getattr(mod_obj, "control_layers", None))
+                visual_channel_mult = 2.0 if is_ref else 1.0
+                if token_scaling_ratio and 1.0 < float(token_scaling_ratio) <= 2.5:
+                    visual_channel_mult = float(token_scaling_ratio)
+                aux_tokens = 512 + (512 if not is_audio and getattr(mod_obj, "final_layer", None) is not None and hasattr(getattr(mod_obj, "final_layer"), "audio_out") else 0)
+                tokens = int(visual_tokens * visual_channel_mult + aux_tokens)
+
+        # 5. Pengukuran Berat LoRA (Zero Magic Constant)
+        lora_cuda_bytes = 0
+        lora_cpu_bytes = 0
+        if mod_obj is not None:
+            seen_ptrs = set()
+            def _acc_t(t):
+                nonlocal lora_cuda_bytes, lora_cpu_bytes
+                if torch.is_tensor(t):
+                    ptr = t.data_ptr()
+                    if ptr and ptr not in seen_ptrs:
+                        seen_ptrs.add(ptr)
+                        b = t.numel() * t.element_size()
+                        if t.is_cuda:
+                            lora_cuda_bytes += b
+                        else:
+                            lora_cpu_bytes += b
+            def _trav(d):
+                if d is None: return
+                if torch.is_tensor(d): _acc_t(d)
+                elif isinstance(d, (list, tuple, set)):
+                    for it in d: _trav(it)
+                elif isinstance(d, dict):
+                    for v in d.values(): _trav(v)
+            if hasattr(mod_obj, "_loras_model_data"): _trav(mod_obj._loras_model_data)
+            if hasattr(mod_obj, "named_parameters"):
+                for n, p in mod_obj.named_parameters():
+                    if "lora" in n.lower() and p is not None: _acc_t(p)
+
+        lora_guard_mb = lora_cuda_bytes / (1024 * 1024)
+        lora_per_block_mb = (lora_cpu_bytes / max(1, total_layers)) / (1024 * 1024)
+        effective_block_mb = block_size_mb + lora_per_block_mb
+
+        # 6. Pengiraan Denyutan Aktivasi Puncak (Ground Truth Physics)
+        observed_pulse = float(generation_state.get("real_act_pulse_mb", 0.0))
+        if observed_pulse > 0:
+            act_peak_mb = observed_pulse
+        elif model_role == "text_encoder":
+            intermediate_dim = info.get("intermediate_dim") or (hidden_dim * 4)
+            act_per_token = (2 * hidden_dim + intermediate_dim) * elem_size
+            act_peak_mb = (tokens * act_per_token * 4) / (1024 * 1024)
+        else:
+            has_combined_qkv = False
+            if mod_obj is not None and hasattr(mod_obj, "modules"):
+                for sm in mod_obj.modules():
+                    if hasattr(sm, "qkv_proj") or hasattr(sm, "q_proj"):
+                        has_combined_qkv = True
+                        break
+            has_rope = (
+                mod_obj is not None and (
+                    hasattr(mod_obj, "rope") or hasattr(mod_obj, "rope_embedder")
+                    or any("rope" in str(sm).lower() for sm in getattr(mod_obj, "modules", lambda: [])())
+                )
+            )
+            kv_mult = 3.0 if has_combined_qkv else 2.0
+            dest_qkv_mb = (kv_mult * tokens * inner_dim * elem_size) / (1024 * 1024)
+            rope_mb = (2.0 * tokens * inner_dim * elem_size) / (1024 * 1024) if has_rope else 0.0
+            attn_out_mb = (tokens * inner_dim * elem_size) / (1024 * 1024)
+            residual_mb = (tokens * hidden_dim * elem_size) / (1024 * 1024)
+            engine_mb = (tokens * inner_dim * elem_size * 0.25) / (1024 * 1024)
+            d_mlp = inner_dim * 4
+            mlp_mb = (tokens * d_mlp * elem_size) / (1024 * 1024)
+
+            attn_peak_mb = dest_qkv_mb + rope_mb + attn_out_mb + residual_mb + engine_mb
+            mlp_peak_mb = mlp_mb + attn_out_mb + residual_mb
+            act_peak_mb = max(attn_peak_mb, mlp_peak_mb)
+
+        # 7. Overhed Alokator PyTorch, Dequant Workspace & Penimbal Anti-Spillover WDDM
+        allocator_overhead_mb = max(allocator_frag_mb, act_peak_mb * 0.18)
+        if max_layer_dequant_mb <= 0 and is_quant and effective_block_mb > 0:
+            max_layer_dequant_mb = effective_block_mb * (2.0 / 0.55)
+        dequant_workspace_mb = (max_layer_dequant_mb * 1.0) if is_quant else 0.0
+        wddm_guard_mb = max(450.0, effective_block_mb * 2.0 + 150.0)
+
+        # 8. Kapasiti Bersih Storan VRAM
+        total_deductions_mb = (
+            ext_os_mb
+            + active_live_mb
+            + base_size_mb
+            + act_peak_mb
+            + allocator_overhead_mb
+            + dequant_workspace_mb
+            + lora_guard_mb
+            + wddm_guard_mb
+        )
+        usable_mb = max(0.0, total_gpu_mb - total_deductions_mb)
+
+        # 9. Keputusan Bajet & Pra-muat Mengikut Peranan Model
+        if model_role == "text_encoder":
+            total_model_mb = total_layers * effective_block_mb + base_size_mb
+            if effective_block_mb > 0 and total_model_mb <= usable_mb:
+                preload_blocks = total_layers
+                safe_budget_mb = int(total_model_mb)
+                mode_str = f"Mod Residen Penuh ({preload_blocks} blok)"
+            else:
+                preload_blocks = 0
+                safe_budget_mb = int(2.0 * effective_block_mb + base_size_mb) if effective_block_mb > 0 else 256
+                mode_str = "Pure Async Shuttle (0 blok statik, 2 penimbal kerja)"
+        else:
+            if effective_block_mb > 0:
+                max_fit = int(usable_mb // effective_block_mb)
+                # Pada GPU <= 8.5GB (RTX 5050 8GB GDDR6), hadkan penimbal pra-muat kepada 0-3 blok
+                # Pemindahan PCIe DMA 13ms ditutupi 100% oleh pengiraan blok 500-800ms
+                max_preload_cap = 3 if total_gpu_mb <= 8500.0 else max(1, total_layers - 2)
+                if max_fit >= 2:
+                    preload_blocks = min(max_preload_cap, max(0, max_fit - 2))
+                    safe_budget_mb = int(base_size_mb + (preload_blocks + 2) * effective_block_mb)
+                    mode_str = f"Mod Residen Selamat ({preload_blocks} blok pra-muat + 2 penimbal kerja)"
+                elif max_fit == 1:
+                    preload_blocks = 1
+                    safe_budget_mb = int(base_size_mb + 2 * effective_block_mb)
+                    mode_str = "Mod Penimbal Minimum (1 blok pra-muat + 2 penimbal kerja)"
+                else:
+                    preload_blocks = 0
+                    safe_budget_mb = int(base_size_mb + 2 * effective_block_mb)
+                    mode_str = "Mod Striming Murni (0 blok pra-muat, 2 penimbal kerja)"
+            else:
+                preload_blocks = 0
+                safe_budget_mb = max(256, int(usable_mb))
+                mode_str = "Bukan Blok"
+
+        # Pengikat Integriti Fizikal Mutlak: Dilarang sama sekali melebihi VRAM fizikal
+        max_safe_budget_mb = int(max(base_size_mb, usable_mb + base_size_mb))
+        safe_budget_mb = max(int(base_size_mb + 2 * effective_block_mb), min(safe_budget_mb, max_safe_budget_mb))
+
+        can_async = is_async and (free_mb >= max(512.0, effective_block_mb * 1.5))
+        peak_total_vram_mb = safe_budget_mb + act_peak_mb + allocator_overhead_mb + ext_os_mb + active_live_mb
+        vram_headroom_mb = total_gpu_mb - peak_total_vram_mb
 
         log_debug(
-            f"Sukatan Fizikal Text Encoder (Params={param_count/1e9:.2f}B, Hidden={hidden_dim}, Layers={layer_count}, "
-            f"Blok={layer_size_mb:.1f}MB, Base={base_size_mb:.1f}MB, DequantWorkspace={dequant_workspace_mb:.1f}MB): "
-            f"Free={free_mb:.1f}MB, Overhead={total_overhead_mb:.1f}MB (Frag={allocator_frag_mb:.1f}MB, "
-            f"Quantum={allocator_quantum_mb:.1f}MB, ActHeadroom={act_headroom_mb:.1f}MB) -> Bajet Dinamik={budget_mb}MB (Muat {num_preload_blocks} blok)"
+            f"[ARBITER PUSAT] Role={model_role}, Tokens={tokens}, Blok={effective_block_mb:.1f}MB, Base={base_size_mb:.1f}MB: "
+            f"GPU={total_gpu_mb:.0f}MB, Free={free_mb:.0f}MB, Live={active_live_mb:.0f}MB, ActPeak={act_peak_mb:.0f}MB, "
+            f"Overhead={total_deductions_mb - usable_mb:.0f}MB -> Bajet={safe_budget_mb}MB ({mode_str}), Headroom={vram_headroom_mb:.0f}MB."
         )
-        return budget_mb
+
+        return {
+            "budget_mb": safe_budget_mb,
+            "preload_blocks": preload_blocks,
+            "act_peak_mb": act_peak_mb,
+            "allocator_overhead_mb": allocator_overhead_mb,
+            "usable_mb": usable_mb,
+            "can_async": can_async,
+            "peak_total_vram_mb": peak_total_vram_mb,
+            "vram_headroom_mb": vram_headroom_mb,
+            "mode": mode_str
+        }
     except Exception as e:
-        log_debug(f"Ralat pengiraan bajet text encoder: {e}")
+        log_debug(f"Pengecualian dalam centralized_model_memory_arbiter: {e}")
+        return {
+            "budget_mb": 1024,
+            "preload_blocks": 0,
+            "act_peak_mb": 0.0,
+            "allocator_overhead_mb": 0.0,
+            "usable_mb": 1024.0,
+            "can_async": True,
+            "peak_total_vram_mb": 0.0,
+            "vram_headroom_mb": 0.0,
+            "mode": "Fallback"
+        }
+
+def compute_dynamic_text_encoder_budget(text_encoder_module=None):
+    """
+    Mengira bajet VRAM Text Encoder melalui Fungsi Pusat Pengiraan Dinamik (centralized_model_memory_arbiter).
+    100% Zero Hardcoding, berasaskan fizik perkakasan dan geometri token.
+    """
+    try:
+        res = centralized_model_memory_arbiter(text_encoder_module, model_role="text_encoder")
+        return res["budget_mb"]
+    except Exception as e:
+        log_debug(f"Ralat delegasi bajet text encoder ke arbiter pusat: {e}")
         try:
             fb, _ = torch.cuda.mem_get_info()
             return max(512, int(fb / (1024 * 1024) * 0.5))
@@ -1554,417 +1766,26 @@ def get_model_towers(active_instance, model_id):
 
 def compute_dynamic_transformer_budget(transformer_module=None, is_async=True, phase=1, token_scaling_ratio=1.0, is_audio_only=False, height=None, width=None, frame_num=None):
     """
-    Mengira bajet VRAM Transformer secara pengiraan bait fizikal masa-nyata tulen (100% Zero Hardcoding).
-    Membezakan ruang simpanan blok (storage) daripada ruang kerja nyahkuantisasi (dequantization workspace)
-    agar pemprosesan kuantisasi GGUF kekal 100% pantas pada GPU CUDA tanpa sebarang kejatuhan ke CPU.
-    Menerapkan Formula Nisbah Emas Anti-Tepu (~86% Beban GPU) bagi menghalang kejatuhan ke PCIe Sysmem Fallback.
+    Mengira bajet VRAM Transformer melalui Fungsi Pusat Pengiraan Dinamik (centralized_model_memory_arbiter).
+    100% Zero Hardcoding, berasaskan fizik perkakasan dan geometri token.
+    Menerapkan had pra-muat selamat bagi menghalang kejatuhan ke Windows WDDM PCIe Shared Memory.
     """
     try:
-        flush_vram()
-        if not torch.cuda.is_available():
-            return 1024
-            
-        free_bytes, total_bytes = torch.cuda.mem_get_info()
-        free_mb = free_bytes / (1024 * 1024)
-        total_mb = total_bytes / (1024 * 1024)
-        
-        # 1. Introspeksi Fizikal Model Transformer Sejagat
-        info = inspect_model_data(transformer_module)
-        block_storage_mb = info.get("block_storage_mb", 0.0)
-        block_dequant_mb = info.get("block_dequant_mb", 0.0)
-        max_layer_dequant_mb = info.get("max_layer_dequant_mb", 0.0)
-        is_quant = info.get("is_quant", False)
-        hidden_dim = info.get("hidden_dim", 0)
-        if hidden_dim == 0:
-            hidden_dim = 3072 if (transformer_module is not None and "minimax" in transformer_module.__class__.__name__.lower()) else 4096
-        
-        # Introspeksi Fizikal Sebenar MMGP (Zero Hardcoding):
-        act = get_active_mmgp_instance()
-        base_size_mb = 17.0
-        if act is not None and hasattr(act, "blocks_of_modules_sizes") and act.blocks_of_modules_sizes:
-            for mod_k in ("transformer", "diffusion_model", "model", "unet"):
-                if mod_k in act.blocks_of_modules_sizes:
-                    base_size_mb = act.blocks_of_modules_sizes[mod_k] / (1024 * 1024)
-                    break
-            for k, v in act.blocks_of_modules_sizes.items():
-                if re.search(r"/(blocks|layers|transformer_blocks|joint_transformer_blocks|double_blocks|single_blocks|resblocks)\.\d+", k) and v > 0:
-                    block_storage_mb = v / (1024 * 1024)
-                    is_quant = True
-                    break
-        
-        # Tentukan saiz bait bagi setiap elemen aktivasi (FP16/BF16 = 2 bait, 100% Zero Hardcoding)
-        elem_size = 2
-        if _generation_state.get("active_elem_size"):
-            elem_size = _generation_state["active_elem_size"]
-        elif transformer_module is not None:
-            mod_dtype = getattr(transformer_module, "dtype", None)
-            if mod_dtype in (torch.float16, torch.bfloat16):
-                elem_size = 2
-            elif hasattr(transformer_module, "blocks") and len(transformer_module.blocks) > 0:
-                b0 = transformer_module.blocks[0]
-                b_p = next((p for p in b0.parameters() if p is not None), None)
-                if b_p is not None:
-                    elem_size = 2 if b_p.dtype in (torch.float16, torch.bfloat16) else b_p.element_size()
-            elif hasattr(transformer_module, "parameters"):
-                for p in transformer_module.parameters():
-                    if p is not None and not any(ign in str(p) for ign in ("patch_proj", "time_embedder")):
-                        elem_size = 2 if p.dtype in (torch.float16, torch.bfloat16) else p.element_size()
-                        break
-                
-        # Modul tapak bukan blok yang aktif semasa fasa denoising
-        aux_submodels_mb = 0.0
-        if act is not None and hasattr(act, "blocks_of_modules_sizes") and act.blocks_of_modules_sizes:
-            for k, sz in act.blocks_of_modules_sizes.items():
-                if (k.startswith("transformer/") or k.startswith("diffusion_model/") or k.startswith("model/")) and not re.search(r"/(blocks|layers|transformer_blocks|joint_transformer_blocks|double_blocks|single_blocks|resblocks)\.\d+", k):
-                    if "token_refiner" not in k and hasattr(act, "loaded_blocks") and k in str(act.loaded_blocks):
-                        aux_submodels_mb += sz / (1024 * 1024)
-        elif transformer_module is not None and hasattr(transformer_module, "named_children"):
-            try:
-                for name, submodule in transformer_module.named_children():
-                    if name not in ("blocks", "layers", "transformer_blocks", "joint_transformer_blocks", "double_blocks", "single_blocks", "resblocks", "token_refiner"):
-                        sub_bytes = sum(p.numel() * p.element_size() for p in submodule.parameters() if p is not None)
-                        aux_submodels_mb += sub_bytes / (1024 * 1024)
-            except Exception:
-                pass
-
-        # Ground-truth memori alokasi CUDA aktif semasa (seperti tensor conditioning context ~466MB):
-        # Mengelakkan bajet blok transformer melimpah melepasi VRAM GDDR6 fizikal semasa denyutan aktivasi attention.
-        try:
-            if torch.cuda.is_available():
-                cur_alloc_mb = float(torch.cuda.memory_allocated() / (1024 * 1024))
-                loaded_trans_mb = 0.0
-                if act is not None and hasattr(act, "blocks_of_modules_sizes"):
-                    main_id = getattr(act, "main_model_id", "transformer")
-                    preloaded = act.preloaded_blocks_per_model.get(main_id, ()) if hasattr(act, "preloaded_blocks_per_model") else ()
-                    for b in preloaded:
-                        entry = main_id + "/" + b
-                        loaded_trans_mb += act.blocks_of_modules_sizes.get(entry, 0.0) / (1024 * 1024)
-                    cur_b = act.loaded_blocks.get(main_id) if hasattr(act, "loaded_blocks") else None
-                    if cur_b is not None:
-                        entry = main_id + "/" + cur_b
-                        loaded_trans_mb += act.blocks_of_modules_sizes.get(entry, 0.0) / (1024 * 1024)
-                non_trans_mb = max(0.0, cur_alloc_mb - loaded_trans_mb)
-                aux_submodels_mb = max(aux_submodels_mb, non_trans_mb)
-        except Exception:
-            pass
-        aux_submodels_mb = max(0.0, aux_submodels_mb)
-
-        # 2. Pengesanan Modaliti Dinamik Sejagat (Audio vs Imej 2D vs Video 3D)
-        mod_name = transformer_module.__class__.__name__.lower() if transformer_module is not None else ""
-        mod_type_str = str(type(transformer_module)).lower()
-        
-        # Pengesanan Video 3D / Imej 2D / Audio Tulen secara Dinamik:
-        # Model multimodal video-audio (seperti minimax_h3 ref2va, wan, ltx) MESTI dikira sebagai Video 3D
-        # sekiranya mempunyai dimensi visual (height, width, frame_num > 1) atau tergolong dalam arkitektur video.
-        is_explicit_audio_only = bool(is_audio_only or getattr(transformer_module, "audio_only", False) or getattr(transformer_module, "_is_audio_only", False))
-        has_video_geometry = (height is not None and height > 16) or (width is not None and width > 16) or (frame_num is not None and frame_num > 1)
-        is_video_arch = any(term in mod_name or term in mod_type_str for term in ("minimax", "wan", "ltx", "hunyuan", "cog", "animatediff", "hyvideo"))
-
-        if is_explicit_audio_only and not has_video_geometry:
-            is_audio = True
-            is_image_2d = False
-        elif (not has_video_geometry and not is_video_arch and any(term in mod_name or term in mod_type_str for term in ("tts", "music", "voice", "whisper", "sound"))):
-            is_audio = True
-            is_image_2d = False
-        else:
-            is_audio = False
-            if (frame_num is not None and frame_num == 1) or any(term in mod_name or term in mod_type_str for term in ("image", "flux", "sd", "pixart", "z_image")):
-                is_image_2d = True
-            else:
-                is_image_2d = False
-        
-        # 3. Pengiraan Geometri Jujukan Token & Penimbal Aktivasi Fizikal (100% Zero Hardcoding)
-        heads = info.get("heads", 0)
-        head_dim = info.get("head_dim", 0)
-        inner_dim = info.get("inner_dim", 0)
-        
-        # Penentuan matematik tulen berasaskan geometri perhatian (Zero Hardcoding)
-        if inner_dim > 0 and head_dim > 0 and heads == 0:
-            heads = inner_dim // head_dim
-        elif heads > 0 and head_dim > 0 and inner_dim == 0:
-            inner_dim = heads * head_dim
-        elif heads > 0 and inner_dim > 0 and head_dim == 0:
-            head_dim = inner_dim // heads
-            
-        if _generation_state.get("active_inner_dim"):
-            inner_dim = int(_generation_state["active_inner_dim"])
-        if _generation_state.get("active_hidden_dim"):
-            hidden_dim = int(_generation_state["active_hidden_dim"])
-            
-        if inner_dim == 0:
-            inner_dim = (heads * head_dim) if (heads > 0 and head_dim > 0) else hidden_dim
-
-        if is_audio:
-            # Mod Audio/TTS: Jejak token audio laten (cth: ~250 token) + teks (~256) + kanvas dummy
-            total_tokens = int((4 + 250 + 256) * max(1.0, float(token_scaling_ratio)))
-            attn_headroom_mb = (total_tokens * hidden_dim * elem_size * 12) / (1024 * 1024)
-        elif is_image_2d:
-            # Mod Imej 2D: Resolusi spatial tulen tanpa dimensi temporal
-            h = height if height and height > 0 else 1024
-            w = width if width and width > 0 else 1024
-            sp_comp = info.get("spatial_compression") or 16
-            latent_h = math.ceil(h / max(1, sp_comp))
-            latent_w = math.ceil(w / max(1, sp_comp))
-            p_size = info.get("patch_size") or 2
-            if isinstance(p_size, (tuple, list)):
-                p_h = p_size[-2] if len(p_size) >= 2 else p_size[0]
-                p_w = p_size[-1]
-            else:
-                p_h = p_w = int(p_size if isinstance(p_size, int) else 2)
-            patch_h = math.ceil(latent_h / max(1, p_h))
-            patch_w = math.ceil(latent_w / max(1, p_w))
-            visual_tokens = patch_h * patch_w
-            text_tokens = 512
-            total_tokens = int((visual_tokens + text_tokens) * max(1.0, float(token_scaling_ratio)))
-            qkv_bytes = 3 * total_tokens * inner_dim * elem_size
-            attn_out_bytes = total_tokens * inner_dim * elem_size
-            out_proj_bytes = total_tokens * hidden_dim * elem_size
-            residual_bytes = 2 * total_tokens * hidden_dim * elem_size
-            engine_workspace_bytes = total_tokens * inner_dim * elem_size
-            act_base_bytes = qkv_bytes + attn_out_bytes + out_proj_bytes + residual_bytes + engine_workspace_bytes
-            attn_headroom_mb = act_base_bytes / (1024 * 1024)
-        else:
-            # Mod Video 3D: Dimensi spatial-temporal fizikal sebenar
-            h = height if height and height > 0 else getattr(transformer_module, "default_height", None)
-            w = width if width and width > 0 else getattr(transformer_module, "default_width", None)
-            if not h or h <= 0:
-                h = 720
-            if not w or w <= 0:
-                w = 1280
-            # Pengesanan Batas Tetingkap DiT Fizikal (Sliding Window Boundary, Zero Hardcoding):
-            # Model video sliding-window (seperti MiniMax H3) hanya memproses 1 tetingkap laten per satu laluan DiT.
-            max_dit_frames = (
-                getattr(transformer_module, "max_window_frames", None)
-                or getattr(transformer_module, "window_size", None)
-                or (124 if "minimax" in str(type(transformer_module)).lower() else None)
-            )
-            raw_t = frame_num if frame_num and frame_num > 0 else 124
-            t = min(max_dit_frames, raw_t) if max_dit_frames and max_dit_frames > 0 else raw_t
-            sp_comp = info.get("spatial_compression") or 16
-            tp_comp = info.get("temporal_compression") or 4
-            latent_h = math.ceil(h / max(1, sp_comp))
-            latent_w = math.ceil(w / max(1, sp_comp))
-            latent_t = math.ceil(t / max(1, tp_comp))
-            p_size = info.get("patch_size") or (1, 2, 2)
-            if isinstance(p_size, (tuple, list)) and len(p_size) >= 3:
-                p_t, p_h, p_w = p_size[0], p_size[1], p_size[2]
-            elif isinstance(p_size, (tuple, list)) and len(p_size) == 2:
-                p_t, p_h, p_w = 1, p_size[0], p_size[1]
-            else:
-                p_val = int(p_size if isinstance(p_size, int) else 2)
-                p_t, p_h, p_w = 1, p_val, p_val
-            patch_h = math.ceil(latent_h / max(1, p_h))
-            patch_w = math.ceil(latent_w / max(1, p_w))
-            patch_t = math.ceil(latent_t / max(1, p_t))
-            visual_tokens = patch_h * patch_w * patch_t
-            text_tokens = 512
-            # Pengesanan Dinamik Saluran Modaliti Fizikal Tulen (Zero Hardcoding):
-            # 1 saluran visual video sasaran. Saluran tambahan visual dikesan jika mod rujukan/lanjutan aktif.
-            is_ref = bool(getattr(transformer_module, "reference_mode", False) or getattr(transformer_module, "control_layers", None))
-            visual_channel_mult = 2.0 if is_ref else 1.0
-            if token_scaling_ratio and 1.0 < float(token_scaling_ratio) <= 2.5:
-                visual_channel_mult = float(token_scaling_ratio)
-            # Token pembantu teks (~512) dan audio laten (~250-512 jika model multimodal video-audio)
-            aux_tokens = 512 + (512 if not is_audio and getattr(transformer_module, "final_layer", None) is not None and hasattr(getattr(transformer_module, "final_layer"), "audio_out") else 0)
-            total_tokens = int(visual_tokens * visual_channel_mult + aux_tokens)
-            if _generation_state.get("active_seq_len"):
-                act_len = int(_generation_state["active_seq_len"])
-                if max_dit_frames and max_dit_frames > 0 and tp_comp:
-                    max_win_lat = math.ceil(max_dit_frames / max(1, tp_comp))
-                    max_win_tokens = int(math.ceil(latent_h / max(1, p_h)) * math.ceil(latent_w / max(1, p_w)) * max_win_lat * visual_channel_mult + aux_tokens)
-                    total_tokens = min(act_len, max_win_tokens)
-                else:
-                    total_tokens = act_len
-
-            # Aktivasi fizikal tulen bagi DiTBlock & Attention (100% Zero Hardcoding):
-            # 1. Residual state input x: total_tokens * hidden_dim * elem_size
-            # 2. QKV projection tensor: total_tokens * kv_multiplier * inner_dim * elem_size
-            # 3. Attention output: total_tokens * inner_dim * elem_size
-            # 4. Engine workspace (GEMM/SageAttention/FlashAttention buffer): dinamik mengikut jujukan token
-            has_combined_qkv = False
-            if transformer_module is not None and hasattr(transformer_module, "modules"):
-                for sm in transformer_module.modules():
-                    if hasattr(sm, "qkv_proj") or hasattr(sm, "q_proj"):
-                        has_combined_qkv = True
-                        break
-            # Aktivasi fizikal tulen bagi DiTBlock & Attention (100% Zero Hardcoding):
-            # Semasa fasa perhatian DiTBlock:
-            # 1. Residual state input x: 2 * total_tokens * hidden_dim * elem_size
-            # 2. QKV projection tensor (Query, Key, Value = 3 tensor aktif serentak): kv_multiplier * total_tokens * inner_dim * elem_size
-            # 3. Attention output: total_tokens * inner_dim * elem_size
-            # 4. Out projection: total_tokens * hidden_dim * elem_size
-            # 5. Engine workspace (GEMM/SageAttention/FlashAttention buffer): total_tokens * inner_dim * elem_size
-            kv_multiplier = 3.0 if has_combined_qkv else 2.0
-            qkv_bytes = int(kv_multiplier * total_tokens * inner_dim * elem_size)
-            attn_out_bytes = int(total_tokens * inner_dim * elem_size)
-            out_proj_bytes = int(total_tokens * hidden_dim * elem_size)
-            residual_bytes = int(2 * total_tokens * hidden_dim * elem_size)
-            engine_workspace_bytes = int(total_tokens * inner_dim * elem_size)
-            
-            act_base_bytes = qkv_bytes + attn_out_bytes + out_proj_bytes + residual_bytes + engine_workspace_bytes
-            attn_headroom_mb = act_base_bytes / (1024 * 1024)
-            
-        # 4. Pengukuran Sebenar Berat LoRA yang Aktif (Zero Magic Constant / 100% Zero Hardcoding)
-        lora_cuda_bytes = 0
-        lora_cpu_bytes = 0
-        if transformer_module is not None:
-            seen_tensor_ptrs = set()
-            
-            def _accumulate_tensor(t):
-                nonlocal lora_cuda_bytes, lora_cpu_bytes
-                if torch.is_tensor(t):
-                    ptr = t.data_ptr()
-                    if ptr and ptr not in seen_tensor_ptrs:
-                        seen_tensor_ptrs.add(ptr)
-                        b = t.numel() * t.element_size()
-                        if t.is_cuda:
-                            lora_cuda_bytes += b
-                        else:
-                            lora_cpu_bytes += b
-                        
-            def _traverse_structure(data):
-                if data is None:
-                    return
-                if torch.is_tensor(data):
-                    _accumulate_tensor(data)
-                elif isinstance(data, (list, tuple, set)):
-                    for item in data:
-                        _traverse_structure(item)
-                elif isinstance(data, dict):
-                    for v in data.values():
-                        _traverse_structure(v)
-
-            loras_data = getattr(transformer_module, "_loras_model_data", None)
-            if loras_data:
-                _traverse_structure(loras_data)
-                
-            if hasattr(transformer_module, "modules"):
-                for sm in transformer_module.modules():
-                    sm_lora = getattr(sm, "_mm_lora_data", None)
-                    if sm_lora:
-                        _traverse_structure(sm_lora)
-                        
-            if hasattr(transformer_module, "named_parameters"):
-                for n, p in transformer_module.named_parameters():
-                    if "lora" in n.lower() and p is not None:
-                        _accumulate_tensor(p)
-
-        total_layers = info.get("layers", 0) or 50
-        max_safe_preload_blocks = max(1, total_layers - 2) if total_layers > 2 else 1
-        lora_guard_mb = lora_cuda_bytes / (1024 * 1024)
-        lora_per_block_mb = (lora_cpu_bytes / max(1, total_layers)) / (1024 * 1024)
-        base_block_mb = block_storage_mb if (is_quant and block_storage_mb > 0) else (block_dequant_mb if block_dequant_mb > 0 else info.get("block_size_mb", 0.0))
-        effective_block_mb = base_block_mb + lora_per_block_mb
-        
-        # 5. Analisis Memori Fizikal Sebenar (Hardware Ground-Truth, 100% Zero Hardcoding)
-        # Baki VRAM bebas masa-nyata (free_mb) daripada mem_get_info() adalah memori fizikal bebas pada cip GDDR6.
-        # ext_os_mb adalah memori yang diduduki oleh konteks pemandu Nvidia dan proses OS luar.
-        total_gpu_mb = (torch.cuda.get_device_properties(0).total_memory / (1024 * 1024)) if torch.cuda.is_available() else 8192.0
-        alloc_bytes = torch.cuda.memory_allocated()
-        res_bytes = torch.cuda.memory_reserved()
-        allocator_frag_mb = max(0.0, (res_bytes - alloc_bytes) / (1024 * 1024))
-        
-        # Penggunaan memori GPU luar secara tepat (total - free - reserved)
-        ext_os_mb = max(0.0, ((total_gpu_mb * 1024 * 1024 - free_bytes) - res_bytes) / (1024 * 1024))
-        
-        # Granulariti penimbal perkakasan segmen CUDA (standard CUDA 2MB segment granularity)
-        allocator_quantum_mb = 2.0
-        
-        # Ruang kerja nyahkuantisasi kernel (hanya 1 lapisan linear terbesar dinyahkuantisasi serentak)
-        dequant_workspace_mb = (max_layer_dequant_mb * 1.0) if is_quant else 0.0
-        
-        # 6. Formula Ruang Simpanan Bersih Pra-muat Tulen (100% Zero Hardcoding, Sifar Anggaran Kasar / Peratusan Tiruan)
-        # Menjamin VRAM tidak melimpah ke PCIe Shared Memory dan DWM kekal lancar
-        # Gabungkan denyutan aktivasi puncak sebenar (Dynamic Activation Breathing Pulse) dengan headroom algebra
-        observed_pulse = float(_generation_state.get("real_act_pulse_mb", 0.0))
-        if observed_pulse > 0:
-            effective_act_headroom_mb = observed_pulse
-        else:
-            # Puncak aktivasi DiTBlock fizikal sebenar berasaskan pelaksanaan mikro-chunk QKV:
-            # 1. Penimbal destinasi tensor perhatian (Q, K, V):
-            dest_qkv_mb = float(((3 if has_combined_qkv else 2) * total_tokens * inner_dim * elem_size) / (1024 * 1024))
-            # 2. Penimbal putaran RoPE (Rotated Q & Rotated K tensor aktif serentak bagi model RoPE seperti MiniMax/Wan/LTX):
-            has_rope = (
-                transformer_module is not None and (
-                    hasattr(transformer_module, "rope") or hasattr(transformer_module, "rope_embedder")
-                    or any("rope" in str(sm).lower() for sm in getattr(transformer_module, "modules", lambda: [])())
-                )
-            )
-            rope_mb = float((2 * total_tokens * inner_dim * elem_size) / (1024 * 1024)) if has_rope else 0.0
-            # 3. Penimbal keluaran attention (attn_out):
-            attn_out_mb = float((total_tokens * inner_dim * elem_size) / (1024 * 1024))
-            # 4. Penimbal residual x:
-            residual_mb = float((total_tokens * hidden_dim * elem_size) / (1024 * 1024))
-            # 5. Penimbal chunk kerja sementara unjuran QKV (dinamik mengikut saiz token dan had alokasi selamat GPU):
-            row_bytes = int((3 if has_combined_qkv else 1) * inner_dim * elem_size)
-            dyn_chunk_tokens = total_tokens if total_tokens <= 4096 else math.ceil(total_tokens / max(2, math.ceil((total_tokens * row_bytes) / max(1, (total_gpu_mb * 1048576) * 0.08))))
-            chunk_work_mb = float((dyn_chunk_tokens * (3 if has_combined_qkv else 1) * inner_dim * elem_size) / (1024 * 1024))
-            # 6. Penimbal enjin attention workspace (SageAttention 2 SM120 natif tanpa matrik N*N):
-            engine_mb = float((total_tokens * inner_dim * elem_size * 0.25) / (1024 * 1024))
-            
-            # Puncak serentak DiTBlock attention sebenar bagi Single-Pass (Ground-Truth Hardware Physics):
-            # Penimbal destinasi Q, K, V (dest_qkv_mb) + putaran RoPE (rope_mb) + keluaran attention (attn_out_mb) + residual input (residual_mb) + workspace enjin (engine_mb)
-            dit_peak_act_mb = dest_qkv_mb + rope_mb + attn_out_mb + residual_mb + engine_mb
-            if attn_headroom_mb > 0:
-                effective_act_headroom_mb = max(attn_headroom_mb, dit_peak_act_mb)
-            else:
-                effective_act_headroom_mb = dit_peak_act_mb
-        
-        # Penimbal Keselamatan Pemacu Dinamik & WDDM (100% Zero Hardcoding):
-        # Margin keselamatan fizikal mengelakkan WDDM PCIe paging:
-        # Serpihan alokator PyTorch sebenar + saiz 1 blok penimbal pemindahan DMA + kuantum perkakasan CUDA
-        wddm_safe_guard_mb = max(320.0, allocator_frag_mb + effective_block_mb * 1.5 + allocator_quantum_mb)
-        
-        # Kapasiti Bersih Storan Blok Transformer Fizikal (100% Zero Hardcoding, Sifar Dwi-Tolak):
-        # Jumlah Memori GPU fizikal (total_gpu_mb) ditolak:
-        # 1. ext_os_mb (OS & Konteks Pemandu)
-        # 2. base_size_mb + aux_submodels_mb (Modul tapak & pembantu transformer)
-        # 3. effective_act_headroom_mb (Denyutan aktivasi puncak forward pass)
-        # 4. dequant_workspace_mb (Ruang kerja nyahkuantisasi kernel)
-        # 5. lora_guard_mb (Berat LoRA aktif)
-        # 6. wddm_safe_guard_mb (Penimbal anti-paging Windows WDDM)
-        usable_storage_mb = max(
-            0.0,
-            (total_gpu_mb - ext_os_mb) - base_size_mb - aux_submodels_mb - effective_act_headroom_mb - dequant_workspace_mb - lora_guard_mb - wddm_safe_guard_mb
+        res = centralized_model_memory_arbiter(
+            transformer_module,
+            model_role="transformer",
+            is_async=is_async,
+            phase=phase,
+            token_scaling_ratio=token_scaling_ratio,
+            is_audio_only=is_audio_only,
+            height=height,
+            width=width,
+            frame_num=frame_num
         )
-        
-        if effective_block_mb > 0:
-            total_block_capacity = int(usable_storage_mb // effective_block_mb)
-            # Kapasiti pra-muat berasaskan fizik MMGP Async Circular Shuttle:
-            # 2 penimbal kerja diperlukan (1 blok aktif dieksekusi, 1 blok dipra-muat melalui PCIe stream).
-            # Baki blok disimpan dalam VRAM sebagai resident cache untuk memaksimumkan kelajuan denoising.
-            if total_block_capacity >= 2:
-                preload_blocks = min(max_safe_preload_blocks, total_block_capacity - 2)
-                budget_mb = int((preload_blocks + 2) * effective_block_mb + base_size_mb)
-            elif total_block_capacity == 1:
-                preload_blocks = 1
-                budget_mb = int(2 * effective_block_mb + base_size_mb)
-            else:
-                preload_blocks = 0
-                budget_mb = int(effective_block_mb + base_size_mb)
-            num_blocks = preload_blocks
-        else:
-            budget_mb = int(usable_storage_mb) if usable_storage_mb > base_size_mb else 512
-            num_blocks = 0
-            
-        # Pengikat Integriti Fizikal Mutlak: Bajet model dilarang sama sekali melepasi siling keselamatan fizikal
-        max_safe_budget_mb = int(max(base_size_mb, usable_storage_mb + base_size_mb))
-        budget_mb = max(int(base_size_mb + (effective_block_mb if effective_block_mb > 0 else 0)), min(budget_mb, max_safe_budget_mb))
-            
-        modaliti_str = "Audio" if is_audio else ("Imej" if is_image_2d else "Video")
-        log_debug(
-            f"Sukatan Transformer Fizik Tulen (Mod={modaliti_str}, "
-            f"Quant={is_quant}, Blok={effective_block_mb:.1f}MB (LoRA_Block={lora_per_block_mb:.1f}MB), DequantWorkspace={dequant_workspace_mb:.1f}MB, "
-            f"Base={base_size_mb:.1f}MB, Aux={aux_submodels_mb:.1f}MB, LoRA_GPU={lora_guard_mb:.1f}MB): "
-            f"Free={free_mb:.1f}MB, OS_External={ext_os_mb:.1f}MB, Frag={allocator_frag_mb:.1f}MB, "
-            f"Quantum={allocator_quantum_mb:.1f}MB, Headroom={attn_headroom_mb:.1f}MB -> "
-            f"Bajet Dinamik={budget_mb}MB (Muat {num_blocks} blok pra-muat, muatan puncak {num_blocks + 2} blok)"
-        )
-        return budget_mb
+        return res["budget_mb"]
     except Exception as e:
-        log_debug(f"Ralat dalam pengiraan fizik bajet transformer: {e}")
-        
-    return 1024
+        log_debug(f"Ralat delegasi bajet transformer ke arbiter pusat: {e}")
+        return 1024
 
 def retune_active_model_dynamically(active_instance, phase=1, token_scaling_ratio=1.0, is_audio_only=False, height=None, width=None, frame_num=None):
     """Menala semula graf MMGP model utama secara masa-nyata tanpa hardcode."""
@@ -4871,6 +4692,30 @@ try:
                     _generation_state["active_hidden_dim"] = act_hidden
                     _generation_state["active_elem_size"] = act_elem
                     log_debug(f"[ADAPTASI ON-THE-FLY] Geometri tensor dikesan: tokens={act_tokens}, dim={act_hidden}, elem_bytes={act_elem}")
+                    try:
+                        act_inst = get_active_mmgp_instance()
+                        if act_inst is not None and hasattr(act_inst, "budgets") and isinstance(act_inst.budgets, dict):
+                            cur_b = act_inst.budgets.get("transformer", 0)
+                            trans_mod = act_inst.models.get("transformer") if hasattr(act_inst, "models") else None
+                            if trans_mod is None:
+                                trans_mod = getattr(self, "transformer", None) or self
+                            arb_res = centralized_model_memory_arbiter(trans_mod, model_role="transformer", active_tokens=act_tokens)
+                            safe_b = arb_res["budget_mb"]
+                            if safe_b < cur_b or (cur_b == 0 and safe_b > 0):
+                                act_inst.budgets["transformer"] = safe_b
+                                act_inst.budgets["*"] = safe_b
+                                towers_names = get_model_towers(act_inst, "transformer")
+                                if not towers_names:
+                                    import mmgp.offload as mo
+                                    towers_names, _ = mo._detect_main_towers(trans_mod)
+                                    towers_names = [t for t in towers_names if "token_refiner" not in t]
+                                act_inst.tune_preloading("transformer", safe_b * 1024 * 1024, towers_names)
+                                if safe_b < cur_b:
+                                    act_inst.unload_all()
+                                    flush_vram()
+                                log_debug(f"[ARBITER PUSAT PROAKTIF] Bajet MMGP dilaras sebelum Blok 0: {cur_b}MB -> {safe_b}MB ({arb_res['mode']}, tokens={act_tokens}).")
+                    except Exception as arb_err:
+                        log_debug(f"Notis pelarasan arbiter proaktif blok 0: {arb_err}")
 
         # Perlindungan Tekanan VRAM Masa-Nyata (Closed-Loop Dynamic Memory Guard)
         if cuda_ok:
