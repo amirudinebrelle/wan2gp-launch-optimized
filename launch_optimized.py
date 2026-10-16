@@ -281,6 +281,16 @@ def evict_module_weights(module, name=""):
     Mengekalkan tensor utuh tanpa swap_tensors(0) bagi memelihara 100% MMGP hooks dan keserasian kuantisasi."""
     if module is None:
         return 0
+    # Lindungi modul yang diuruskan oleh MMGP daripada diubah penunjuk memori C++ secara luaran
+    try:
+        active_inst = get_active_mmgp_instance()
+        if active_inst is not None and hasattr(active_inst, "models"):
+            for m_id, m_obj in list(active_inst.models.items()):
+                if m_obj is module or (hasattr(module, "_mm_id") and getattr(module, "_mm_id") == m_id):
+                    safe_mmgp_unload(active_inst, m_id)
+                    return 1
+    except Exception:
+        pass
     moved_count = 0
     try:
         if isinstance(module, torch.nn.Module):
@@ -304,28 +314,13 @@ def evict_h3_auxiliary_modules(container):
             if active_inst is not None:
                 try:
                     safe_mmgp_unload(active_inst, mod_id)
+                    evicted_total += 1
                 except Exception:
                     pass
-        if hasattr(container, "vae") and container.vae is not None:
-            evicted_total += evict_module_weights(getattr(container.vae, "decoder", None))
-            evicted_total += evict_module_weights(getattr(container.vae, "post_quant_conv", None))
-            evicted_total += evict_module_weights(getattr(container.vae, "encoder", None))
-            evicted_total += evict_module_weights(getattr(container.vae, "quant_conv", None))
-        if hasattr(container, "audio_vae") and container.audio_vae is not None:
-            evicted_total += evict_module_weights(container.audio_vae)
-        if hasattr(container, "latent_upscaler") and container.latent_upscaler is not None:
-            evicted_total += evict_module_weights(container.latent_upscaler)
-        if hasattr(container, "video_encoder") and container.video_encoder is not None:
-            evicted_total += evict_module_weights(container.video_encoder)
-        if isinstance(container, dict):
-            for k in ("vae", "video_encoder", "audio_vae", "latent_upscaler"):
-                m = container.get(k)
-                if m is not None:
-                    evicted_total += evict_module_weights(m)
         flush_vram()
         trim_current_process_working_set()
         if evicted_total > 0:
-            log_debug(f"[OFFLOAD PEMBANTU] {evicted_total} parameter modul pembantu dialihkan ke CPU (VRAM 100% bebas untuk Transformer).")
+            log_debug(f"[OFFLOAD PEMBANTU] Modul pembantu dipunggah bersih menerusi MMGP (VRAM 100% bebas untuk Transformer).")
     except Exception as ex:
         log_debug(f"[OFFLOAD PEMBANTU] Ralat mengalihkan modul pembantu: {ex}")
     return evicted_total
@@ -1726,12 +1721,25 @@ def compute_dynamic_transformer_budget(transformer_module=None, is_async=True, p
         observed_pulse = float(_generation_state.get("real_act_pulse_mb", 0.0))
         if observed_pulse > 0:
             effective_act_headroom_mb = observed_pulse
-        elif attn_headroom_mb > 0:
-            # Hadkan anggaran algebra kepada kapasiti fizikal silikon maksimum yang munasabah bagi GPU
-            max_possible_act = max(512.0, total_gpu_mb - ext_os_mb - base_size_mb - effective_block_mb - 512.0)
-            effective_act_headroom_mb = min(attn_headroom_mb, max_possible_act)
         else:
-            effective_act_headroom_mb = max(512.0, float((total_tokens * hidden_dim * elem_size * 4) / (1024 * 1024)))
+            # Puncak aktivasi DiTBlock fizikal sebenar berasaskan pelaksanaan mikro-chunk QKV:
+            # 1. Penimbal destinasi tensor perhatian (Q, K, V):
+            dest_qkv_mb = float(((3 if has_combined_qkv else 2) * total_tokens * inner_dim * elem_size) / (1024 * 1024))
+            # 2. Penimbal keluaran attention (attn_out):
+            attn_out_mb = float((total_tokens * inner_dim * elem_size) / (1024 * 1024))
+            # 3. Penimbal residual x:
+            residual_mb = float((total_tokens * hidden_dim * elem_size) / (1024 * 1024))
+            # 4. Penimbal chunk kerja sementara unjuran QKV (maksimum 1 chunk 8192 token):
+            chunk_work_mb = min(512.0, float((min(total_tokens, 8192) * 3 * inner_dim * elem_size) / (1024 * 1024)))
+            # 5. Penimbal enjin attention workspace (SageAttention 2 SM120 / SDPA):
+            engine_mb = min(384.0, float((total_tokens * inner_dim * elem_size * 0.5) / (1024 * 1024)))
+            
+            # Puncak serentak DiTBlock attention sebenar (mengelakkan anggaran 7GB melampau yang melumpuhkan muatan blok):
+            dit_peak_act_mb = dest_qkv_mb + attn_out_mb + chunk_work_mb + residual_mb + engine_mb
+            if attn_headroom_mb > 0:
+                effective_act_headroom_mb = min(attn_headroom_mb, dit_peak_act_mb)
+            else:
+                effective_act_headroom_mb = dit_peak_act_mb
         
         # Penimbal Keselamatan Pemacu Dinamik & WDDM (100% Zero Hardcoding):
         # Margin keselamatan fizikal mengelakkan WDDM PCIe paging:
@@ -4324,15 +4332,28 @@ try:
                 # 2. Penimbal keluaran operasi attention (attn_out)
                 attn_out_bytes = seq_len * inner * x.element_size()
                 
-                # Puncak serentak maksimum fizik sebenar bagi fasa Attention (Q, K, V + Attention output):
-                peak_attn_bytes = dest_qkv_bytes + attn_out_bytes
-                
                 # 3. Jumlah bait fizikal unjuran penuh QKV
                 full_qkv_bytes = seq_len * row_bytes
                 
-                # 4. Syarat Single-Pass Matematik Tulen:
+                # 4. Penimbal Keselamatan Anti-Paging Windows WDDM (dinamik 8% VRAM perkakasan):
+                wddm_safe_guard_bytes = max(256 * 1024 * 1024, int(total_bytes * 0.08))
+
+                # Puncak serentak sebenar unjuran satu-laluan (Single-Pass Peak):
+                # Mengelakkan limpahan PCIe WDDM ke DDR5 RAM yang memperlahankan unjuran sebanyak 17x
+                qkv_w = getattr(self.qkv_proj, "weight", None) if not split_qkv else None
+                can_slice_w = (
+                    torch.is_tensor(qkv_w)
+                    and not hasattr(qkv_w, "qtype")
+                    and qkv_w.is_floating_point()
+                    and qkv_w.dim() == 2
+                    and qkv_w.shape[0] == 3 * inner
+                )
+                interm_bytes = 0 if (split_qkv or can_slice_w) else full_qkv_bytes
+                single_pass_peak = dest_qkv_bytes + interm_bytes + attn_out_bytes + wddm_safe_guard_bytes
+
+                # Syarat Single-Pass Matematik Tulen:
                 # Hanya jika VRAM bebas dikesan di bawah puncak serentak, segarkan cache PyTorch:
-                if (not is_retry) and (effective_free < peak_attn_bytes):
+                if (not is_retry) and (effective_free < single_pass_peak):
                     _diag_free_before = effective_free
                     _diag_t_flush = time.perf_counter()
                     flush_vram()
@@ -4342,13 +4363,13 @@ try:
                         effective_free = free_bytes + max(0, cached_unused)
                     log_debug(
                         f"[DIAG RESCUE] Langkah {_h3_diag['step']} Blok {_h3_diag['block_in_step']}: "
-                        f"effective_free={_diag_free_before / 1048576:.1f}MB < puncak={peak_attn_bytes / 1048576:.1f}MB "
+                        f"effective_free={_diag_free_before / 1048576:.1f}MB < puncak={single_pass_peak / 1048576:.1f}MB "
                         f"-> selepas flush={effective_free / 1048576:.1f}MB, "
-                        f"single_pass={'Ya' if effective_free >= peak_attn_bytes else 'Tidak'}, "
+                        f"single_pass={'Ya' if effective_free >= single_pass_peak else 'Tidak'}, "
                         f"kos={(time.perf_counter() - _diag_t_flush) * 1000.0:.1f}ms"
                     )
 
-                can_single_pass = (not is_retry) and (effective_free >= peak_attn_bytes)
+                can_single_pass = (not is_retry) and (effective_free >= single_pass_peak)
 
                 do_prof = _h3_diag["prof_active"] and not is_retry
                 if do_prof and torch.cuda.is_available():
@@ -4400,9 +4421,9 @@ try:
                         query, key, value = q_c, k_c, v_c
                 else:
                     # Pecahan seimbang dinamik matematik tulen:
-                    # Baki ruang selamat untuk peruntukan sementara selepas menolak penimbal destinasi Q,K,V
-                    headroom_for_temp = max(row_bytes, effective_free - dest_qkv_bytes - attn_out_bytes)
-                    num_chunks = max(1, math.ceil(full_qkv_bytes / headroom_for_temp))
+                    # Baki ruang selamat untuk peruntukan sementara selepas menolak penimbal destinasi Q,K,V dan penimbal WDDM
+                    headroom_for_temp = max(row_bytes, effective_free - dest_qkv_bytes - attn_out_bytes - wddm_safe_guard_bytes)
+                    num_chunks = max(2, math.ceil(full_qkv_bytes / max(1, headroom_for_temp)))
                     tokens_per_chunk = math.ceil(seq_len / num_chunks)
                     chunk_tokens = min(seq_len, max(min_compute_tokens, ((tokens_per_chunk + tile_tokens - 1) // tile_tokens) * tile_tokens))
                     
@@ -4692,7 +4713,10 @@ try:
         gap_ms = (now - _h3_diag["last_block_end"]) * 1000.0 if _h3_diag["last_block_end"] is not None else -1.0
         unload_before = _h3_diag["unload_count"]
         if cuda_ok:
-            torch.cuda.synchronize()
+            try:
+                torch.cuda.synchronize()
+            except Exception:
+                flush_vram()
         t_blk = time.perf_counter()
 
         _h3_diag["prof_active"] = blk < 2
@@ -4702,11 +4726,29 @@ try:
                                                   run_idx=f"L{step} B{blk}")
             else:
                 res = _orig_dit_block_forward(self, x_list, temb, segments, rope, residual_signature_elements)
+            if cuda_ok:
+                torch.cuda.synchronize()
+        except (torch.OutOfMemoryError, torch.AcceleratorError, RuntimeError, Exception) as e_blk:
+            err_blk_s = str(e_blk).lower()
+            if "out of memory" in err_blk_s or "cuda" in err_blk_s or "acceleratorerror" in err_blk_s:
+                flush_vram()
+                log_debug(f"[DIAG RESCUE BLOK] Ralat memori di Langkah {step} Blok {blk} ({e_blk}). Memulihkan alokasi...")
+                try:
+                    act = get_active_mmgp_instance()
+                    if act is not None and hasattr(act, "unload_all"):
+                        act.unload_all()
+                        flush_vram()
+                    res = _orig_dit_block_forward(self, x_list, temb, segments, rope, residual_signature_elements)
+                    if cuda_ok:
+                        torch.cuda.synchronize()
+                except Exception as e_retry:
+                    log_debug(f"[DIAG RESCUE BLOK] Percubaan semula gagal: {e_retry}")
+                    raise e_retry
+            else:
+                raise e_blk
         finally:
             _h3_diag["prof_active"] = False
 
-        if cuda_ok:
-            torch.cuda.synchronize()
         t_end = time.perf_counter()
         _h3_diag["last_block_end"] = t_end
         try:
