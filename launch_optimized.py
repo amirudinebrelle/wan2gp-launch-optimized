@@ -738,8 +738,16 @@ def safe_mmgp_unload(active_instance, target_key):
                 if hasattr(active_instance, "loaded_blocks") and active_instance.loaded_blocks.get(model_id):
                     active_instance.gpu_unload_blocks(model_id, active_instance.loaded_blocks[model_id])
                     active_instance.loaded_blocks[model_id] = None
-                # JANGAN buang model_id daripada active_models_ids atau padam block_slots di sini!
-                # Pengekalan pendaftaran model memastikan pasca-penjanaan unload_all() MMGP dapat menyahmuatnya dengan sempurna tanpa kebocoran VRAM.
+                # Segerakkan active_models_ids dan active_models secara dinamik:
+                # Memastikan MMGP mengetahui model ini tidak lagi di GPU,
+                # supaya ensure_model_loaded(model_id) memuatkannya ke GPU secara sah jika dipanggil kemudian.
+                if hasattr(active_instance, "active_models_ids"):
+                    while model_id in active_instance.active_models_ids:
+                        active_instance.active_models_ids.remove(model_id)
+                if hasattr(active_instance, "active_models"):
+                    m_obj = active_instance.models.get(model_id)
+                    while m_obj in active_instance.active_models:
+                        active_instance.active_models.remove(m_obj)
                 try:
                     from mmgp.allocator import ram as mmgp_ram
                     mmgp_ram.release()
@@ -2537,7 +2545,16 @@ try:
             if model_id not in self.models:
                 return None
             try:
-                return _original_gpu_unload(self, model_id, blocks_name, *args, **kwargs)
+                res = _original_gpu_unload(self, model_id, blocks_name, *args, **kwargs)
+                if blocks_name is None:
+                    if hasattr(self, "active_models_ids"):
+                        while model_id in self.active_models_ids:
+                            self.active_models_ids.remove(model_id)
+                    if hasattr(self, "active_models"):
+                        m_obj = self.models.get(model_id)
+                        while m_obj in self.active_models:
+                            self.active_models.remove(m_obj)
+                return res
             except KeyError:
                 return None
         mmgp_offload.offload.gpu_unload_blocks = _patched_gpu_unload
@@ -3157,6 +3174,32 @@ except Exception as e:
     log_debug(f"Pintasan vae_decode gagal: {e}")
 
 try:
+    import models.minimax_h3.minimax_h3_main as h3_main
+    _orig_load_video_vae = getattr(h3_main, "_load_video_vae", None)
+    if _orig_load_video_vae is not None and not hasattr(h3_main, "_tracked_load_video_vae_installed"):
+        @functools.wraps(_orig_load_video_vae)
+        def _tracked_load_video_vae(filename, *args, **kwargs):
+            vae = _orig_load_video_vae(filename, *args, **kwargs)
+            if vae is not None:
+                setattr(vae, "_source_file", filename)
+            return vae
+        h3_main._load_video_vae = _tracked_load_video_vae
+        h3_main._tracked_load_video_vae_installed = True
+
+    _orig_load_audio_vae = getattr(h3_main, "_load_audio_vae", None)
+    if _orig_load_audio_vae is not None and not hasattr(h3_main, "_tracked_load_audio_vae_installed"):
+        @functools.wraps(_orig_load_audio_vae)
+        def _tracked_load_audio_vae(filename, *args, **kwargs):
+            avae = _orig_load_audio_vae(filename, *args, **kwargs)
+            if avae is not None:
+                setattr(avae, "_source_file", filename)
+            return avae
+        h3_main._load_audio_vae = _tracked_load_audio_vae
+        h3_main._tracked_load_audio_vae_installed = True
+except Exception:
+    pass
+
+try:
     import models.minimax_h3.video_vae as h3_video_vae
 
     def reload_h3_video_vae_decoder(vae):
@@ -3165,9 +3208,11 @@ try:
             from shared.utils import files_locator as fl
             from mmgp import offload
             from models.minimax_h3.minimax_h3_main import VIDEO_VAE_FILE, get_video_vae_linear_split_map
-            fn = getattr(vae, "_source_file", None) or fl.locate_file(VIDEO_VAE_FILE, error_if_none=False)
+            fn = getattr(vae, "_source_file", None)
             if not fn or not os.path.exists(fn):
                 fn = fl.locate_file("ckpts/minimax_h3_video_vae_fp8mix.safetensors", error_if_none=False)
+            if not fn or not os.path.exists(fn):
+                fn = fl.locate_file(VIDEO_VAE_FILE, error_if_none=False)
             if not fn or not os.path.exists(fn):
                 return 0
             t0 = time.perf_counter()
@@ -3192,7 +3237,10 @@ try:
                 for p_name, p in mod.named_parameters():
                     k = prefix + p_name
                     if k in sd and p.numel() == 0:
-                        torch.utils.swap_tensors(p, sd[k])
+                        val = sd[k]
+                        if val.dtype != p.dtype:
+                            val = val.to(dtype=p.dtype)
+                        torch.utils.swap_tensors(p, val)
                         reloaded += 1
             del sd
             t_el = time.perf_counter() - t0
@@ -3208,9 +3256,11 @@ try:
             from shared.utils import files_locator as fl
             from mmgp import offload
             from models.minimax_h3.minimax_h3_main import VIDEO_VAE_FILE, get_video_vae_linear_split_map
-            fn = getattr(vae, "_source_file", None) or fl.locate_file(VIDEO_VAE_FILE, error_if_none=False)
+            fn = getattr(vae, "_source_file", None)
             if not fn or not os.path.exists(fn):
                 fn = fl.locate_file("ckpts/minimax_h3_video_vae_fp8mix.safetensors", error_if_none=False)
+            if not fn or not os.path.exists(fn):
+                fn = fl.locate_file(VIDEO_VAE_FILE, error_if_none=False)
             if not fn or not os.path.exists(fn):
                 return 0
             t0 = time.perf_counter()
@@ -3226,7 +3276,10 @@ try:
                 for p_name, p in mod.named_parameters():
                     k = prefix + p_name
                     if k in sd and p.numel() == 0:
-                        torch.utils.swap_tensors(p, sd[k])
+                        val = sd[k]
+                        if val.dtype != p.dtype:
+                            val = val.to(dtype=p.dtype)
+                        torch.utils.swap_tensors(p, val)
                         reloaded += 1
             del sd
             t_el = time.perf_counter() - t0
@@ -3297,9 +3350,21 @@ try:
             enc_p = next(self.encoder.parameters(), None) if hasattr(self, "encoder") else None
             if enc_p is not None and enc_p.numel() == 0:
                 reload_h3_video_vae_encoder(self)
+            active_inst = get_active_mmgp_instance()
+            if active_inst is not None:
+                if hasattr(active_inst, "active_models_ids"):
+                    while "video_encoder" in active_inst.active_models_ids:
+                        active_inst.active_models_ids.remove("video_encoder")
+                if hasattr(active_inst, "loaded_blocks"):
+                    active_inst.loaded_blocks["video_encoder"] = None
             try:
                 return _orig_h3_vae_encode(self, *args, **kwargs)
             finally:
+                if active_inst is not None:
+                    try:
+                        safe_mmgp_unload(active_inst, "video_encoder")
+                    except Exception:
+                        pass
                 evict_module_weights(getattr(self, "encoder", None))
                 evict_module_weights(getattr(self, "quant_conv", None))
                 flush_vram()
@@ -3314,9 +3379,21 @@ try:
             enc_p = next(self.encoder.parameters(), None) if hasattr(self, "encoder") else None
             if enc_p is not None and enc_p.numel() == 0:
                 reload_h3_video_vae_encoder(self)
+            active_inst = get_active_mmgp_instance()
+            if active_inst is not None:
+                if hasattr(active_inst, "active_models_ids"):
+                    while "video_encoder" in active_inst.active_models_ids:
+                        active_inst.active_models_ids.remove("video_encoder")
+                if hasattr(active_inst, "loaded_blocks"):
+                    active_inst.loaded_blocks["video_encoder"] = None
             try:
                 return _orig_h3_vae_encode_cond(self, *args, **kwargs)
             finally:
+                if active_inst is not None:
+                    try:
+                        safe_mmgp_unload(active_inst, "video_encoder")
+                    except Exception:
+                        pass
                 evict_module_weights(getattr(self, "encoder", None))
                 evict_module_weights(getattr(self, "quant_conv", None))
                 flush_vram()
@@ -3365,7 +3442,10 @@ try:
             reloaded = 0
             for p_name, p in audio_vae.named_parameters():
                 if p_name in sd and p.numel() == 0:
-                    torch.utils.swap_tensors(p, sd[p_name])
+                    val = sd[p_name]
+                    if val.dtype != p.dtype:
+                        val = val.to(dtype=p.dtype)
+                    torch.utils.swap_tensors(p, val)
                     reloaded += 1
             del sd
             t_el = time.perf_counter() - t0
@@ -3384,10 +3464,16 @@ try:
         a_p = next(self.parameters(), None)
         if a_p is not None and a_p.numel() == 0:
             reload_h3_audio_vae(self)
+        active_inst = get_active_mmgp_instance()
+        if active_inst is not None:
+            if hasattr(active_inst, "active_models_ids"):
+                while "audio_vae" in active_inst.active_models_ids:
+                    active_inst.active_models_ids.remove("audio_vae")
+            if hasattr(active_inst, "loaded_blocks"):
+                active_inst.loaded_blocks["audio_vae"] = None
         try:
             return universal_auto_healing_call(_orig_h3_audio_vae_decode, self, *args, **kwargs)
         finally:
-            active_inst = get_active_mmgp_instance()
             if active_inst is not None:
                 try:
                     safe_mmgp_unload(active_inst, "audio_vae")
@@ -3416,9 +3502,21 @@ try:
             a_p = next(self.parameters(), None)
             if a_p is not None and a_p.numel() == 0:
                 reload_h3_audio_vae(self)
+            active_inst = get_active_mmgp_instance()
+            if active_inst is not None:
+                if hasattr(active_inst, "active_models_ids"):
+                    while "audio_vae" in active_inst.active_models_ids:
+                        active_inst.active_models_ids.remove("audio_vae")
+                if hasattr(active_inst, "loaded_blocks"):
+                    active_inst.loaded_blocks["audio_vae"] = None
             try:
                 return _orig_h3_audio_vae_encode(self, *args, **kwargs)
             finally:
+                if active_inst is not None:
+                    try:
+                        safe_mmgp_unload(active_inst, "audio_vae")
+                    except Exception:
+                        pass
                 evict_module_weights(self)
                 flush_vram()
                 trim_current_process_working_set()
@@ -3448,7 +3546,10 @@ try:
             reloaded = 0
             for p_name, p in upscaler.named_parameters():
                 if p_name in sd and p.numel() == 0:
-                    torch.utils.swap_tensors(p, sd[p_name])
+                    val = sd[p_name]
+                    if val.dtype != p.dtype:
+                        val = val.to(dtype=p.dtype)
+                    torch.utils.swap_tensors(p, val)
                     reloaded += 1
             del sd
             t_el = time.perf_counter() - t0
@@ -3465,9 +3566,21 @@ try:
         up_p = next(self.parameters(), None)
         if up_p is not None and up_p.numel() == 0:
             reload_h3_latent_upscaler(self)
+        active_inst = get_active_mmgp_instance()
+        if active_inst is not None:
+            if hasattr(active_inst, "active_models_ids"):
+                while "latent_upscaler" in active_inst.active_models_ids:
+                    active_inst.active_models_ids.remove("latent_upscaler")
+            if hasattr(active_inst, "loaded_blocks"):
+                active_inst.loaded_blocks["latent_upscaler"] = None
         try:
             return _orig_h3_upscaler_forward(self, *args, **kwargs)
         finally:
+            if active_inst is not None:
+                try:
+                    safe_mmgp_unload(active_inst, "latent_upscaler")
+                except Exception:
+                    pass
             evict_module_weights(self)
             flush_vram()
             trim_current_process_working_set()
