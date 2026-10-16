@@ -277,23 +277,35 @@ def _deep_release_finished_module(module, module_id=""):
         log_debug(f"[ON-DEMAND LIFECYCLE] Ralat pelupusan pantas '{module_id}': {e}")
 
 def evict_module_weights(module, name=""):
-    """Menyingkirkan bobot parameter modul ke Disk dengan menukar storage kepada 0-bait (RAM hos bebas serta-merta)."""
+    """Membebaskan VRAM GPU dengan mengalihkan modul ke RAM hos (CPU) tanpa memusnahkan struktur tensor (Zero VRAM Waste).
+    Mengekalkan tensor utuh tanpa swap_tensors(0) bagi memelihara 100% MMGP hooks dan keserasian kuantisasi."""
     if module is None:
         return 0
-    evicted_count = 0
-    for p in module.parameters():
-        if p.numel() > 0:
-            empty = torch.empty(0, dtype=p.dtype, device="cpu")
-            torch.utils.swap_tensors(p, empty)
-            evicted_count += 1
-    return evicted_count
+    moved_count = 0
+    try:
+        if isinstance(module, torch.nn.Module):
+            for p in module.parameters():
+                if p is not None and p.is_cuda:
+                    moved_count += 1
+            if moved_count > 0:
+                module.to("cpu")
+    except Exception:
+        pass
+    return moved_count
 
 def evict_h3_auxiliary_modules(container):
-    """Menyingkirkan kesemua 4 modul pembantu MiniMax H3 daripada RAM hos ke disk (Zero RAM Waste, ~3.9GB bebas)."""
+    """Mengalihkan kesemua modul pembantu MiniMax H3 ke RAM hos (CPU) dan membebaskan VRAM (Zero VRAM Waste, Zero Corruption)."""
     if container is None:
         return 0
     evicted_total = 0
     try:
+        active_inst = get_active_mmgp_instance()
+        for mod_id in ("video_encoder", "vae", "audio_vae", "latent_upscaler"):
+            if active_inst is not None:
+                try:
+                    safe_mmgp_unload(active_inst, mod_id)
+                except Exception:
+                    pass
         if hasattr(container, "vae") and container.vae is not None:
             evicted_total += evict_module_weights(getattr(container.vae, "decoder", None))
             evicted_total += evict_module_weights(getattr(container.vae, "post_quant_conv", None))
@@ -303,15 +315,19 @@ def evict_h3_auxiliary_modules(container):
             evicted_total += evict_module_weights(container.audio_vae)
         if hasattr(container, "latent_upscaler") and container.latent_upscaler is not None:
             evicted_total += evict_module_weights(container.latent_upscaler)
+        if hasattr(container, "video_encoder") and container.video_encoder is not None:
+            evicted_total += evict_module_weights(container.video_encoder)
         if isinstance(container, dict):
             for k in ("vae", "video_encoder", "audio_vae", "latent_upscaler"):
                 m = container.get(k)
                 if m is not None:
                     evicted_total += evict_module_weights(m)
+        flush_vram()
+        trim_current_process_working_set()
         if evicted_total > 0:
-            log_debug(f"[ON-DEMAND DISK-TO-RAM] {evicted_total} parameter modul pembantu (Video VAE, Video Encoder, Audio VAE, Latent Upscaler) disingkirkan dari RAM hos (0 bait di RAM).")
+            log_debug(f"[OFFLOAD PEMBANTU] {evicted_total} parameter modul pembantu dialihkan ke CPU (VRAM 100% bebas untuk Transformer).")
     except Exception as ex:
-        log_debug(f"[ON-DEMAND DISK-TO-RAM] Ralat menyingkirkan modul pembantu: {ex}")
+        log_debug(f"[OFFLOAD PEMBANTU] Ralat mengalihkan modul pembantu: {ex}")
     return evicted_total
 
 def _vacuum_vmm_orphan_allocations():
@@ -3297,6 +3313,25 @@ try:
             log_debug(f"[ON-DEMAND DISK-TO-RAM] Ralat memuatkan semula Video VAE Encoder: {ex}")
             return 0
 
+    def _ensure_submodules_on_device(parent, submod_names, target_device):
+        """Penyegerak Peranti Sub-Modul Universal: Memastikan peranti parameter sub-modul selaras 100% dengan target_device."""
+        if parent is None or target_device is None:
+            return
+        try:
+            target_dev_obj = torch.device(target_device)
+            for name in submod_names:
+                sub = getattr(parent, name, None)
+                if sub is not None and isinstance(sub, torch.nn.Module):
+                    needs_sync = False
+                    for p in sub.parameters():
+                        if p is not None and p.device != target_dev_obj:
+                            needs_sync = True
+                            break
+                    if needs_sync:
+                        sub.to(target_dev_obj)
+        except Exception as ex:
+            log_debug(f"[DEVICE SYNC] Gagal menyelaraskan {submod_names} ke {target_device}: {ex}")
+
     _orig_h3_vae_decode = h3_video_vae.MiniMaxH3VideoVAE.decode
 
     @functools.wraps(_orig_h3_vae_decode)
@@ -3326,14 +3361,17 @@ try:
         if dec_p is not None and dec_p.numel() == 0:
             reload_h3_video_vae_decoder(self)
 
+        # Penyelarasan Peranti Dinamik: Pastikan bobot decoder dan post_quant_conv berada pada target_device input
+        video_input = args[0] if len(args) > 0 else kwargs.get("video")
+        target_device = (video_input.device if video_input is not None and torch.is_tensor(video_input) else None) or kwargs.get("device") or getattr(self, "device", None) or "cuda"
+        _ensure_submodules_on_device(self, ("decoder", "post_quant_conv"), target_device)
+
         # KONTINUUM PEMULIHAN (SSD LATENT CHECKPOINT DUMP):
         # Simpan laten siap 100% denoising ke SSD sebelum fasa VAE bermula.
-        # Sekiranya ralat berlaku, 16 minit pengiraan denoising tidak akan hangus!
         recovery_dir = os.path.join("workspaces", "recovery")
         recovery_path = os.path.join(recovery_dir, "minimax_last_denoised_latents.pt")
         try:
             os.makedirs(recovery_dir, exist_ok=True)
-            video_input = args[0] if len(args) > 0 else kwargs.get("video")
             if video_input is not None and torch.is_tensor(video_input):
                 uint8_r = args[1] if len(args) > 1 else kwargs.get("uint8_rounding", True)
                 torch.save({
@@ -3366,7 +3404,7 @@ try:
                     safe_mmgp_unload(active_inst, "vae")
                 except Exception:
                     pass
-            # On-Demand: Segera singkirkan bobot Video VAE decoder kembali ke disk
+            # Alihkan modul decoder kembali ke CPU bagi membebaskan VRAM tanpa merosakkan tensor
             evict_module_weights(getattr(self, "decoder", None))
             evict_module_weights(getattr(self, "post_quant_conv", None))
             flush_vram()
@@ -3377,7 +3415,7 @@ try:
             except Exception:
                 pass
             trim_current_process_working_set()
-            log_debug("[MINIMAX H3 LIFECYCLE] Fasa 3 (Video VAE Decode) selesai! Bobot VAE Decoder (~2.32 GB) disingkirkan ke Disk (Zero Leak).")
+            log_debug("[MINIMAX H3 LIFECYCLE] Fasa 3 (Video VAE Decode) selesai! VAE Decoder dialihkan ke RAM hos (Zero Leak).")
 
     h3_video_vae.MiniMaxH3VideoVAE.decode = _safe_h3_vae_decode
 
@@ -3389,16 +3427,12 @@ try:
             enc_p = next(self.encoder.parameters(), None) if hasattr(self, "encoder") else None
             if enc_p is not None and enc_p.numel() == 0:
                 reload_h3_video_vae_encoder(self)
-            active_inst = get_active_mmgp_instance()
-            if active_inst is not None:
-                if hasattr(active_inst, "active_models_ids"):
-                    while "video_encoder" in active_inst.active_models_ids:
-                        active_inst.active_models_ids.remove("video_encoder")
-                if hasattr(active_inst, "loaded_blocks"):
-                    active_inst.loaded_blocks["video_encoder"] = None
+            target_device = kwargs.get("device") or (args[1] if len(args) > 1 else None) or (args[0].device if len(args) > 0 and torch.is_tensor(args[0]) else None) or getattr(self, "device", None) or "cuda"
+            _ensure_submodules_on_device(self, ("encoder", "quant_conv"), target_device)
             try:
                 return _orig_h3_vae_encode(self, *args, **kwargs)
             finally:
+                active_inst = get_active_mmgp_instance()
                 if active_inst is not None:
                     try:
                         safe_mmgp_unload(active_inst, "video_encoder")
@@ -3418,16 +3452,12 @@ try:
             enc_p = next(self.encoder.parameters(), None) if hasattr(self, "encoder") else None
             if enc_p is not None and enc_p.numel() == 0:
                 reload_h3_video_vae_encoder(self)
-            active_inst = get_active_mmgp_instance()
-            if active_inst is not None:
-                if hasattr(active_inst, "active_models_ids"):
-                    while "video_encoder" in active_inst.active_models_ids:
-                        active_inst.active_models_ids.remove("video_encoder")
-                if hasattr(active_inst, "loaded_blocks"):
-                    active_inst.loaded_blocks["video_encoder"] = None
+            target_device = kwargs.get("device") or (args[1] if len(args) > 1 else None) or (args[0].device if len(args) > 0 and torch.is_tensor(args[0]) else None) or getattr(self, "device", None) or "cuda"
+            _ensure_submodules_on_device(self, ("encoder", "quant_conv"), target_device)
             try:
                 return _orig_h3_vae_encode_cond(self, *args, **kwargs)
             finally:
+                active_inst = get_active_mmgp_instance()
                 if active_inst is not None:
                     try:
                         safe_mmgp_unload(active_inst, "video_encoder")
@@ -3507,22 +3537,24 @@ try:
         a_p = next(self.parameters(), None)
         if a_p is not None and a_p.numel() == 0:
             reload_h3_audio_vae(self)
-        active_inst = get_active_mmgp_instance()
-        if active_inst is not None:
-            if hasattr(active_inst, "active_models_ids"):
-                while "audio_vae" in active_inst.active_models_ids:
-                    active_inst.active_models_ids.remove("audio_vae")
-            if hasattr(active_inst, "loaded_blocks"):
-                active_inst.loaded_blocks["audio_vae"] = None
+        audio_input = args[0] if len(args) > 0 else kwargs.get("audio") or kwargs.get("x")
+        target_device = (audio_input.device if audio_input is not None and torch.is_tensor(audio_input) else None) or kwargs.get("device") or "cuda"
+        try:
+            target_dev_obj = torch.device(target_device)
+            p = next(self.parameters(), None)
+            if p is not None and p.device != target_dev_obj:
+                self.to(target_dev_obj)
+        except Exception:
+            pass
         try:
             return universal_auto_healing_call(_orig_h3_audio_vae_decode, self, *args, **kwargs)
         finally:
+            active_inst = get_active_mmgp_instance()
             if active_inst is not None:
                 try:
                     safe_mmgp_unload(active_inst, "audio_vae")
                 except Exception:
                     pass
-            # On-Demand: Segera singkirkan bobot Audio VAE kembali ke disk
             evict_module_weights(self)
             flush_vram()
             gc.collect()
@@ -3534,7 +3566,7 @@ try:
             except Exception:
                 pass
             trim_current_process_working_set()
-            log_debug("[MINIMAX H3 LIFECYCLE] Fasa 3 (Audio VAE Decode) selesai! Audio VAE (~0.58 GB) disingkirkan ke Disk (Zero Leak).")
+            log_debug("[MINIMAX H3 LIFECYCLE] Fasa 3 (Audio VAE Decode) selesai! Audio VAE dialihkan ke RAM hos (Zero Leak).")
 
     h3_audio_vae.MiniMaxH3AudioVAE.decode = _safe_h3_audio_vae_decode
 
@@ -3545,16 +3577,19 @@ try:
             a_p = next(self.parameters(), None)
             if a_p is not None and a_p.numel() == 0:
                 reload_h3_audio_vae(self)
-            active_inst = get_active_mmgp_instance()
-            if active_inst is not None:
-                if hasattr(active_inst, "active_models_ids"):
-                    while "audio_vae" in active_inst.active_models_ids:
-                        active_inst.active_models_ids.remove("audio_vae")
-                if hasattr(active_inst, "loaded_blocks"):
-                    active_inst.loaded_blocks["audio_vae"] = None
+            audio_input = args[0] if len(args) > 0 else kwargs.get("audio") or kwargs.get("x")
+            target_device = (audio_input.device if audio_input is not None and torch.is_tensor(audio_input) else None) or kwargs.get("device") or "cuda"
+            try:
+                target_dev_obj = torch.device(target_device)
+                p = next(self.parameters(), None)
+                if p is not None and p.device != target_dev_obj:
+                    self.to(target_dev_obj)
+            except Exception:
+                pass
             try:
                 return _orig_h3_audio_vae_encode(self, *args, **kwargs)
             finally:
+                active_inst = get_active_mmgp_instance()
                 if active_inst is not None:
                     try:
                         safe_mmgp_unload(active_inst, "audio_vae")
@@ -3609,16 +3644,19 @@ try:
         up_p = next(self.parameters(), None)
         if up_p is not None and up_p.numel() == 0:
             reload_h3_latent_upscaler(self)
-        active_inst = get_active_mmgp_instance()
-        if active_inst is not None:
-            if hasattr(active_inst, "active_models_ids"):
-                while "latent_upscaler" in active_inst.active_models_ids:
-                    active_inst.active_models_ids.remove("latent_upscaler")
-            if hasattr(active_inst, "loaded_blocks"):
-                active_inst.loaded_blocks["latent_upscaler"] = None
+        x_input = args[0] if len(args) > 0 else kwargs.get("x")
+        target_device = (x_input.device if x_input is not None and torch.is_tensor(x_input) else None) or kwargs.get("device") or "cuda"
+        try:
+            target_dev_obj = torch.device(target_device)
+            p = next(self.parameters(), None)
+            if p is not None and p.device != target_dev_obj:
+                self.to(target_dev_obj)
+        except Exception:
+            pass
         try:
             return _orig_h3_upscaler_forward(self, *args, **kwargs)
         finally:
+            active_inst = get_active_mmgp_instance()
             if active_inst is not None:
                 try:
                     safe_mmgp_unload(active_inst, "latent_upscaler")
@@ -3627,7 +3665,7 @@ try:
             evict_module_weights(self)
             flush_vram()
             trim_current_process_working_set()
-            log_debug("[MINIMAX H3 LIFECYCLE] Latent Upscaler (~0.66 GB) disingkirkan ke Disk selepas upscaling selesai.")
+            log_debug("[MINIMAX H3 LIFECYCLE] Latent Upscaler dialihkan ke RAM hos selepas upscaling selesai.")
 
     h3_latent_upscaler.MiniMaxH3LatentUpscaler.forward = _safe_h3_upscaler_forward
     log_debug("Perisai 9e: MiniMax H3 Latent Upscaler True On-Demand Disk-to-RAM berjaya dipasang.")
@@ -5362,14 +5400,15 @@ def main():
     replacement_abort_exit = '''                send_cmd("error", new_error)
                 clear_status(state)
                 try:
-                    import sys, traceback
+                    _tb_mod = __import__("traceback")
+                    _sys_mod = __import__("sys")
                     if 'e' in locals():
                         if hasattr(locals()['e'], '__traceback__') and locals()['e'].__traceback__ is not None:
-                            traceback.clear_frames(locals()['e'].__traceback__)
+                            _tb_mod.clear_frames(locals()['e'].__traceback__)
                             locals()['e'].__traceback__ = None
-                    _cur_exc = sys.exc_info()
+                    _cur_exc = _sys_mod.exc_info()
                     if _cur_exc[2] is not None:
-                        traceback.clear_frames(_cur_exc[2])
+                        _tb_mod.clear_frames(_cur_exc[2])
                 except Exception:
                     pass
                 try:
