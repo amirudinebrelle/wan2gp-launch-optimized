@@ -733,30 +733,18 @@ def safe_mmgp_unload(active_instance, target_key):
                     active_instance.auto_preload.on_unload(all_mids)
                 except Exception:
                     pass
-            # 5. Pindahkan sebarang parameter dan buffer CUDA model berdaftar ke CPU secara mutlak & potong storan fizikal
+            # 5. Pindahkan sebarang parameter dan buffer CUDA model berdaftar ke CPU secara selamat
             for mid in all_mids:
                 m_obj = active_instance.models.get(mid)
                 if m_obj is not None and hasattr(m_obj, "parameters"):
                     for p in m_obj.parameters():
                         if p is not None and getattr(p, "is_cuda", False):
                             try:
-                                st = p.untyped_storage()
-                                if st.is_cuda and st.size() > 0:
-                                    st.resize_(0)
-                            except Exception:
-                                pass
-                            try:
                                 p.data = p.data.to("cpu")
                             except Exception:
                                 pass
                     for b in m_obj.buffers():
                         if b is not None and getattr(b, "is_cuda", False):
-                            try:
-                                st = b.untyped_storage()
-                                if st.is_cuda and st.size() > 0:
-                                    st.resize_(0)
-                            except Exception:
-                                pass
                             try:
                                 b.data = b.data.to("cpu")
                             except Exception:
@@ -851,29 +839,17 @@ def safe_mmgp_unload(active_instance, target_key):
                         active_instance.auto_preload.on_unload([model_id])
                     except Exception:
                         pass
-                # Pindahkan sebarang parameter dan buffer CUDA modul ini ke CPU & potong storan fizikal
+                # Pindahkan sebarang parameter dan buffer CUDA modul ini ke CPU secara selamat
                 m_obj = active_instance.models.get(model_id)
                 if m_obj is not None and hasattr(m_obj, "parameters"):
                     for p in m_obj.parameters():
                         if p is not None and getattr(p, "is_cuda", False):
-                            try:
-                                st = p.untyped_storage()
-                                if st.is_cuda and st.size() > 0:
-                                    st.resize_(0)
-                            except Exception:
-                                pass
                             try:
                                 p.data = p.data.to("cpu")
                             except Exception:
                                 pass
                     for b in m_obj.buffers():
                         if b is not None and getattr(b, "is_cuda", False):
-                            try:
-                                st = b.untyped_storage()
-                                if st.is_cuda and st.size() > 0:
-                                    st.resize_(0)
-                            except Exception:
-                                pass
                             try:
                                 b.data = b.data.to("cpu")
                             except Exception:
@@ -957,6 +933,25 @@ def _safe_embedding(input, weight, padding_idx=None, max_norm=None, norm_type=2.
         _set_guard("in_emb", False)
 
 torch.nn.functional.embedding = _safe_embedding
+
+# Perisai Sejagat Resilient Conv3D (cuDNN Blackwell Engine Fallback Guard)
+# Menyelesaikan ralat 'RuntimeError: GET was unable to find an engine to execute this computation'
+_orig_conv3d = torch.nn.functional.conv3d
+@functools.wraps(_orig_conv3d)
+def _resilient_conv3d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
+    try:
+        return _orig_conv3d(input, weight, bias=bias, stride=stride, padding=padding, dilation=dilation, groups=groups)
+    except RuntimeError as conv_err:
+        err_s = str(conv_err).lower()
+        if "engine" in err_s or "cudnn" in err_s:
+            log_debug(f"[CUDNN RESCUE] cuDNN gagal mencari engine conv3d ({conv_err}). Mengaktifkan fallback PyTorch ATen native...")
+            with torch.backends.cudnn.flags(enabled=False):
+                safe_inp = input.contiguous() if torch.is_tensor(input) else input
+                safe_w = weight.contiguous() if torch.is_tensor(weight) else weight
+                return _orig_conv3d(safe_inp, safe_w, bias=bias, stride=stride, padding=padding, dilation=dilation, groups=groups)
+        raise conv_err
+torch.nn.functional.conv3d = _resilient_conv3d
+log_debug("Perisai Sejagat Resilient Conv3D (cuDNN Blackwell Engine Fallback Guard) berjaya dipasang.")
 
 # Pintasan GGUF Proaktif Sejagat: Menapis Berdasarkan Nisbah Lonjakan Memori Fizikal Masa-Nyata
 try:
@@ -3640,18 +3635,20 @@ try:
             if enc_p is not None and enc_p.numel() == 0:
                 reload_h3_video_vae_encoder(self)
             target_device = kwargs.get("device") or (args[1] if len(args) > 1 else None) or (args[0].device if len(args) > 0 and torch.is_tensor(args[0]) else None) or getattr(self, "device", None) or "cuda"
-            _ensure_submodules_on_device(self, ("encoder", "quant_conv"), target_device)
+            active_inst = get_active_mmgp_instance()
+            if active_inst is None or "video_encoder" not in getattr(active_inst, "models", {}):
+                _ensure_submodules_on_device(self, ("encoder", "quant_conv"), target_device)
             try:
                 return _orig_h3_vae_encode(self, *args, **kwargs)
             finally:
-                active_inst = get_active_mmgp_instance()
                 if active_inst is not None:
                     try:
                         safe_mmgp_unload(active_inst, "video_encoder")
                     except Exception:
                         pass
-                evict_module_weights(getattr(self, "encoder", None))
-                evict_module_weights(getattr(self, "quant_conv", None))
+                else:
+                    evict_module_weights(getattr(self, "encoder", None))
+                    evict_module_weights(getattr(self, "quant_conv", None))
                 flush_vram()
                 trim_current_process_working_set()
 
@@ -3665,18 +3662,20 @@ try:
             if enc_p is not None and enc_p.numel() == 0:
                 reload_h3_video_vae_encoder(self)
             target_device = kwargs.get("device") or (args[1] if len(args) > 1 else None) or (args[0].device if len(args) > 0 and torch.is_tensor(args[0]) else None) or getattr(self, "device", None) or "cuda"
-            _ensure_submodules_on_device(self, ("encoder", "quant_conv"), target_device)
+            active_inst = get_active_mmgp_instance()
+            if active_inst is None or "video_encoder" not in getattr(active_inst, "models", {}):
+                _ensure_submodules_on_device(self, ("encoder", "quant_conv"), target_device)
             try:
                 return _orig_h3_vae_encode_cond(self, *args, **kwargs)
             finally:
-                active_inst = get_active_mmgp_instance()
                 if active_inst is not None:
                     try:
                         safe_mmgp_unload(active_inst, "video_encoder")
                     except Exception:
                         pass
-                evict_module_weights(getattr(self, "encoder", None))
-                evict_module_weights(getattr(self, "quant_conv", None))
+                else:
+                    evict_module_weights(getattr(self, "encoder", None))
+                    evict_module_weights(getattr(self, "quant_conv", None))
                 flush_vram()
                 trim_current_process_working_set()
 
