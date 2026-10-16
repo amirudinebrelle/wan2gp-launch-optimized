@@ -2212,14 +2212,12 @@ def centralized_model_memory_arbiter(
 
         hidden_dim = info.get("hidden_dim", 0) or 3072
         total_layers = info.get("layers", 0)
-        if total_layers <= 1:
-            total_layers = 50 if model_role == "text_encoder" else (36 if (mod_obj is not None and "minimax" in str(type(mod_obj)).lower()) else 30)
         block_size_mb = info.get("block_size_mb", 0.0) or info.get("block_storage_mb", 0.0)
         base_size_mb = info.get("base_size_mb", 0.0)
         is_quant = info.get("is_quant", False)
         max_layer_dequant_mb = info.get("max_layer_dequant_mb", 0.0)
 
-        # Crosscheck dengan MMGP active_instance
+        # Crosscheck dengan MMGP active_instance secara 100% Introspektif (Zero Hardcoding)
         act = get_active_mmgp_instance()
         if act is not None and hasattr(act, "blocks_of_modules_sizes") and act.blocks_of_modules_sizes:
             prefix_keys = ("text_encoder", "text_model", "encoder") if model_role == "text_encoder" else ("transformer", "diffusion_model", "model", "unet")
@@ -2228,12 +2226,35 @@ def centralized_model_memory_arbiter(
                     if mod_k in act.blocks_of_modules_sizes:
                         base_size_mb = act.blocks_of_modules_sizes[mod_k] / (1024 * 1024)
                         break
-            if block_size_mb <= 0:
-                for k, v in act.blocks_of_modules_sizes.items():
-                    if any(mod_k in k for mod_k in prefix_keys) and re.search(r"/(layers|blocks|block|transformer_blocks|resblocks)\.\d+", k) and v > 0:
-                        block_size_mb = v / (1024 * 1024)
+            detected_indices = set()
+            detected_sizes = []
+            for k, v in act.blocks_of_modules_sizes.items():
+                if any(mod_k in k for mod_k in prefix_keys):
+                    m = re.search(r"/(?:layers|blocks|block|transformer_blocks|resblocks)\.(\d+)", k)
+                    if m and v > 0:
+                        detected_indices.add(int(m.group(1)))
+                        detected_sizes.append(v / (1024 * 1024))
                         is_quant = True
-                        break
+            if detected_indices and total_layers <= 1:
+                total_layers = max(detected_indices) + 1
+            if detected_sizes and block_size_mb <= 0:
+                block_size_mb = sum(detected_sizes) / len(detected_sizes)
+
+        # Introspeksi susulan daripada pipeline aktif jika layers belum dipopulasikan
+        if total_layers <= 1:
+            try:
+                active_pipeline = getattr(launch_optimized, "_active_pipeline", None)
+                cand_mod = getattr(active_pipeline, model_role, None) if active_pipeline is not None else None
+                if cand_mod is not None:
+                    cand_info = inspect_model_data(cand_mod)
+                    if cand_info.get("layers", 0) > 1:
+                        total_layers = cand_info["layers"]
+                    if block_size_mb <= 0 and cand_info.get("block_size_mb", 0.0) > 0:
+                        block_size_mb = cand_info["block_size_mb"]
+            except Exception:
+                pass
+
+        total_layers = max(1, total_layers)
 
         if base_size_mb <= 0:
             base_size_mb = 17.0 if model_role != "text_encoder" else 0.0
@@ -2412,17 +2433,16 @@ def centralized_model_memory_arbiter(
                 safe_budget_mb = int(total_model_mb)
                 mode_str = f"Mod Residen Penuh ({preload_blocks} blok)"
             else:
-                # Bajet Sasaran 3.xx GB VRAM (3200 MB - 3600 MB) pada RTX 5050 Laptop GPU (8GB)
-                # Memastikan blok-blok GGUF Text Encoder dimuatkan secara pantas ke CUDA untuk inferens <30s
-                target_vram_mb = min(usable_mb * 0.70, 3600.0)
+                # Peruntukan dinamik berasaskan pecahan anjal VRAM bebas selamat (100% Zero Hardcoding)
+                safe_block_capacity_mb = usable_mb * 0.60
                 if effective_block_mb > 0:
-                    max_blocks = max(2, int((target_vram_mb - base_size_mb) // effective_block_mb))
+                    max_blocks = max(2, min(total_layers, int((safe_block_capacity_mb - base_size_mb) // effective_block_mb)))
                     preload_blocks = max(0, max_blocks - 2)
                     safe_budget_mb = int(base_size_mb + max_blocks * effective_block_mb)
-                    mode_str = f"Mod Residen Berkelajuan Tinggi ({preload_blocks} blok pra-muat + 2 penimbal kerja, ~{safe_budget_mb}MB)"
+                    mode_str = f"Mod Residen Dinamik ({preload_blocks} blok pra-muat + 2 penimbal kerja, ~{safe_budget_mb}MB)"
                 else:
                     preload_blocks = 0
-                    safe_budget_mb = int(target_vram_mb)
+                    safe_budget_mb = int(safe_block_capacity_mb)
                     mode_str = "Mod Asinkron Dinamik"
         else:
             if effective_block_mb > 0:
@@ -2491,6 +2511,10 @@ def compute_dynamic_text_encoder_budget(text_encoder_module=None):
     Mengira bajet VRAM Text Encoder melalui Fungsi Pusat Pengiraan Dinamik (centralized_model_memory_arbiter).
     100% Zero Hardcoding, berasaskan fizik perkakasan dan geometri token.
     """
+    if text_encoder_module is None:
+        act = get_active_mmgp_instance()
+        if act is not None and hasattr(act, "models") and "text_encoder" in act.models:
+            text_encoder_module = act.models["text_encoder"]
     try:
         res = centralized_model_memory_arbiter(text_encoder_module, model_role="text_encoder")
         return res["budget_mb"]
