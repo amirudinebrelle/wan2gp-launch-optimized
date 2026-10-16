@@ -1102,6 +1102,7 @@ def safe_mmgp_unload(active_instance, target_key):
 # ------------------------------------------------------------------------------
 _orig_embedding = torch.nn.functional.embedding
 
+@functools.wraps(_orig_embedding)
 def _safe_embedding(input, weight, padding_idx=None, max_norm=None, norm_type=2.0, scale_grad_by_freq=False, sparse=False, *args, **kwargs):
     if _is_guard_active("in_emb"):
         return _orig_embedding(input, weight, padding_idx=padding_idx, max_norm=max_norm, norm_type=norm_type, scale_grad_by_freq=scale_grad_by_freq, sparse=sparse, *args, **kwargs)
@@ -1209,7 +1210,7 @@ def _make_resilient_conv(orig_conv_fn, name="conv"):
     def _resilient_wrapper(input, weight, bias=None, *args, **kwargs):
         input, weight, bias = _harmonize_conv_operands(input, weight, bias)
         try:
-            return orig_conv_fn(input, weight, bias=bias, *args, **kwargs)
+            return orig_conv_fn(input, weight, bias, *args, **kwargs)
         except RuntimeError as conv_err:
             err_s = str(conv_err).lower()
             if "engine" in err_s or "cudnn" in err_s:
@@ -1218,7 +1219,7 @@ def _make_resilient_conv(orig_conv_fn, name="conv"):
                     safe_inp = input.contiguous() if torch.is_tensor(input) else input
                     safe_w = weight.contiguous() if torch.is_tensor(weight) else weight
                     safe_b = bias.contiguous() if (bias is not None and torch.is_tensor(bias)) else bias
-                    return orig_conv_fn(safe_inp, safe_w, bias=safe_b, *args, **kwargs)
+                    return orig_conv_fn(safe_inp, safe_w, safe_b, *args, **kwargs)
 
             if "type" in err_s or "device" in err_s or "should be the same" in err_s or "same device" in err_s or "contiguous" in err_s or "mismatch" in err_s:
                 log_debug(f"[{name.upper()} HARMONIZER RESCUE] Membetulkan ralat peranti/tipe {name}: {conv_err}. Menyelaras semula...")
@@ -1229,13 +1230,13 @@ def _make_resilient_conv(orig_conv_fn, name="conv"):
                 safe_b = bias.to(device=target_dev, dtype=target_dt).contiguous() if (bias is not None and torch.is_tensor(bias)) else bias
                 try:
                     with torch.backends.cudnn.flags(enabled=False):
-                        return orig_conv_fn(safe_inp, safe_w, bias=safe_b, *args, **kwargs)
+                        return orig_conv_fn(safe_inp, safe_w, safe_b, *args, **kwargs)
                 except Exception as retry_err:
                     log_debug(f"[{name.upper()} CPU FALLBACK RESCUE] Mengalihkan {name} ke CPU secara selamat: {retry_err}...")
                     inp_c = input.cpu().contiguous()
                     w_c = weight.cpu().contiguous()
                     b_c = bias.cpu().contiguous() if (bias is not None and torch.is_tensor(bias)) else bias
-                    res_c = orig_conv_fn(inp_c, w_c, bias=b_c, *args, **kwargs)
+                    res_c = orig_conv_fn(inp_c, w_c, b_c, *args, **kwargs)
                     return res_c.to(device=input.device, dtype=input.dtype)
             raise conv_err
     return _resilient_wrapper
@@ -1317,25 +1318,12 @@ log_debug("Perisai Sejagat LayerNorm & GroupNorm (Universal Device/Dtype Harmoni
 
 # ==========================================================================
 # Perisai Sejagat Embedding, SDPA, & Interpolate (Universal Device/Dtype Harmonizer)
-# Menyelesaikan mismatch peranti embedding, attention SDPA, dan CPU bfloat16 interpolate
 # ==========================================================================
-_orig_embedding = torch.nn.functional.embedding
+# Perisai Sejagat SDPA & Interpolate (Universal Device/Dtype Harmonizer)
+# Menyelesaikan mismatch peranti attention SDPA dan CPU bfloat16 interpolate
+# ==========================================================================
 _orig_sdpa = torch.nn.functional.scaled_dot_product_attention
 _orig_interpolate = torch.nn.functional.interpolate
-
-@functools.wraps(_orig_embedding)
-def _safe_embedding(input, weight, padding_idx=None, max_norm=None, norm_type=2.0, scale_grad_by_freq=False, sparse=False):
-    if torch.is_tensor(input) and torch.is_tensor(weight):
-        if input.device != weight.device:
-            input = input.to(device=weight.device)
-    try:
-        return _orig_embedding(input, weight, padding_idx=padding_idx, max_norm=max_norm, norm_type=norm_type, scale_grad_by_freq=scale_grad_by_freq, sparse=sparse)
-    except Exception as emb_err:
-        err_s = str(emb_err).lower()
-        if "device" in err_s or "same" in err_s:
-            input = input.to(device=weight.device)
-            return _orig_embedding(input, weight, padding_idx=padding_idx, max_norm=max_norm, norm_type=norm_type, scale_grad_by_freq=scale_grad_by_freq, sparse=sparse)
-        raise emb_err
 
 @functools.wraps(_orig_sdpa)
 def _safe_sdpa(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, enable_gqa=False):
@@ -1383,10 +1371,352 @@ def _safe_interpolate(input, size=None, scale_factor=None, mode='nearest', align
             return res.to(dtype=orig_dt)
         raise int_err
 
-torch.nn.functional.embedding = _safe_embedding
 torch.nn.functional.scaled_dot_product_attention = _safe_sdpa
 torch.nn.functional.interpolate = _safe_interpolate
-log_debug("Perisai Sejagat Embedding, SDPA, & Interpolate (Universal Device/Dtype Harmonizer Guard) berjaya dipasang.")
+log_debug("Perisai Sejagat SDPA & Interpolate (Universal Device/Dtype Harmonizer Guard) berjaya dipasang.")
+
+# ==========================================================================
+# Perisai Sejagat torch.cat & torch.stack (Universal Device/Dtype Harmonizer)
+# Menyelesaikan 'Expected all tensors to be on the same device' semasa perangkaian tensor
+# ==========================================================================
+_orig_cat = torch.cat
+_orig_stack = torch.stack
+
+@functools.wraps(_orig_cat)
+def _safe_cat(tensors, dim=0, *args, **kwargs):
+    if tensors and len(tensors) > 1:
+        target_dev = None
+        target_dt = None
+        for t in tensors:
+            if torch.is_tensor(t) and t.is_cuda:
+                target_dev = t.device
+                target_dt = t.dtype
+                break
+        if target_dev is None and torch.is_tensor(tensors[0]):
+            target_dev = tensors[0].device
+            target_dt = tensors[0].dtype
+
+        if target_dev is not None:
+            new_tensors = []
+            mismatch_found = False
+            for t in tensors:
+                if torch.is_tensor(t):
+                    need_dev = t.device != target_dev
+                    need_dt = (target_dt is not None and t.dtype != target_dt and t.dtype.is_floating_point and target_dt.is_floating_point)
+                    if need_dev or need_dt:
+                        mismatch_found = True
+                        cur = t
+                        if need_dev:
+                            cur = cur.to(device=target_dev)
+                        if need_dt:
+                            cur = cur.to(dtype=target_dt)
+                        new_tensors.append(cur)
+                    else:
+                        new_tensors.append(t)
+                else:
+                    new_tensors.append(t)
+            if mismatch_found:
+                tensors = type(tensors)(new_tensors) if isinstance(tensors, (list, tuple)) else new_tensors
+    try:
+        return _orig_cat(tensors, dim=dim, *args, **kwargs)
+    except Exception as cat_err:
+        err_s = str(cat_err).lower()
+        if "device" in err_s or "same" in err_s or "type" in err_s or "dtype" in err_s:
+            log_debug(f"[TORCH.CAT RESCUE] Menyelaras peranti/dtype tensor untuk torch.cat: {cat_err}...")
+            first_t = next((t for t in tensors if torch.is_tensor(t)), None)
+            target_dev = first_t.device if first_t is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            target_dt = first_t.dtype if (first_t is not None and first_t.dtype.is_floating_point) else None
+            aligned = []
+            for t in tensors:
+                if torch.is_tensor(t):
+                    cur = t.to(device=target_dev)
+                    if target_dt is not None and cur.dtype.is_floating_point:
+                        cur = cur.to(dtype=target_dt)
+                    aligned.append(cur)
+                else:
+                    aligned.append(t)
+            return _orig_cat(aligned, dim=dim, *args, **kwargs)
+        raise cat_err
+
+@functools.wraps(_orig_stack)
+def _safe_stack(tensors, dim=0, *args, **kwargs):
+    if tensors and len(tensors) > 1:
+        target_dev = None
+        target_dt = None
+        for t in tensors:
+            if torch.is_tensor(t) and t.is_cuda:
+                target_dev = t.device
+                target_dt = t.dtype
+                break
+        if target_dev is None and torch.is_tensor(tensors[0]):
+            target_dev = tensors[0].device
+            target_dt = tensors[0].dtype
+
+        if target_dev is not None:
+            new_tensors = []
+            mismatch_found = False
+            for t in tensors:
+                if torch.is_tensor(t):
+                    need_dev = t.device != target_dev
+                    need_dt = (target_dt is not None and t.dtype != target_dt and t.dtype.is_floating_point and target_dt.is_floating_point)
+                    if need_dev or need_dt:
+                        mismatch_found = True
+                        cur = t
+                        if need_dev:
+                            cur = cur.to(device=target_dev)
+                        if need_dt:
+                            cur = cur.to(dtype=target_dt)
+                        new_tensors.append(cur)
+                    else:
+                        new_tensors.append(t)
+                else:
+                    new_tensors.append(t)
+            if mismatch_found:
+                tensors = type(tensors)(new_tensors) if isinstance(tensors, (list, tuple)) else new_tensors
+    try:
+        return _orig_stack(tensors, dim=dim, *args, **kwargs)
+    except Exception as stack_err:
+        err_s = str(stack_err).lower()
+        if "device" in err_s or "same" in err_s or "type" in err_s or "dtype" in err_s:
+            log_debug(f"[TORCH.STACK RESCUE] Menyelaras peranti/dtype tensor untuk torch.stack: {stack_err}...")
+            first_t = next((t for t in tensors if torch.is_tensor(t)), None)
+            target_dev = first_t.device if first_t is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            target_dt = first_t.dtype if (first_t is not None and first_t.dtype.is_floating_point) else None
+            aligned = []
+            for t in tensors:
+                if torch.is_tensor(t):
+                    cur = t.to(device=target_dev)
+                    if target_dt is not None and cur.dtype.is_floating_point:
+                        cur = cur.to(dtype=target_dt)
+                    aligned.append(cur)
+                else:
+                    aligned.append(t)
+            return _orig_stack(aligned, dim=dim, *args, **kwargs)
+        raise stack_err
+
+torch.cat = _safe_cat
+torch.stack = _safe_stack
+log_debug("Perisai Sejagat torch.cat & torch.stack (Universal Device/Dtype Harmonizer Guard) berjaya dipasang.")
+
+# ==========================================================================
+# Perisai Sejagat Tensor Arithmetic & RoPE (Universal Cross-Device Harmonizer)
+# Menyelesaikan 'Expected all tensors to be on the same device' untuk operasi
+# aritmetik element-wise (inv_freq, mean, std, scale, rotary embeddings)
+# ==========================================================================
+_orig_torch_mul = torch.mul
+_orig_torch_add = torch.add
+_orig_torch_sub = torch.sub
+_orig_torch_div = torch.div
+
+def _harmonize_binary_operands(a, b):
+    if torch.is_tensor(a) and torch.is_tensor(b) and a.device != b.device:
+        if a.is_cuda and not b.is_cuda:
+            b = b.to(device=a.device)
+        elif b.is_cuda and not a.is_cuda:
+            a = a.to(device=b.device)
+    return a, b
+
+@functools.wraps(_orig_torch_mul)
+def _safe_torch_mul(input, other, *args, **kwargs):
+    input, other = _harmonize_binary_operands(input, other)
+    return _orig_torch_mul(input, other, *args, **kwargs)
+
+@functools.wraps(_orig_torch_add)
+def _safe_torch_add(input, other, *args, **kwargs):
+    input, other = _harmonize_binary_operands(input, other)
+    return _orig_torch_add(input, other, *args, **kwargs)
+
+@functools.wraps(_orig_torch_sub)
+def _safe_torch_sub(input, other, *args, **kwargs):
+    input, other = _harmonize_binary_operands(input, other)
+    return _orig_torch_sub(input, other, *args, **kwargs)
+
+@functools.wraps(_orig_torch_div)
+def _safe_torch_div(input, other, *args, **kwargs):
+    input, other = _harmonize_binary_operands(input, other)
+    return _orig_torch_div(input, other, *args, **kwargs)
+
+torch.mul = _safe_torch_mul
+torch.add = _safe_torch_add
+torch.sub = _safe_torch_sub
+torch.div = _safe_torch_div
+
+_orig_tensor_mul = torch.Tensor.__mul__
+_orig_tensor_rmul = torch.Tensor.__rmul__
+_orig_tensor_add = torch.Tensor.__add__
+_orig_tensor_radd = torch.Tensor.__radd__
+_orig_tensor_sub = torch.Tensor.__sub__
+_orig_tensor_rsub = torch.Tensor.__rsub__
+_orig_tensor_div = torch.Tensor.__truediv__
+_orig_tensor_rdiv = torch.Tensor.__rtruediv__
+
+def _make_safe_tensor_binop(orig_op):
+    @functools.wraps(orig_op)
+    def _safe_binop(self, other):
+        if torch.is_tensor(other) and self.device != other.device:
+            if self.is_cuda and not other.is_cuda:
+                other = other.to(device=self.device)
+            elif other.is_cuda and not self.is_cuda:
+                self = self.to(device=other.device)
+        try:
+            return orig_op(self, other)
+        except RuntimeError as r_err:
+            if "same device" in str(r_err).lower() or "device" in str(r_err).lower():
+                target_dev = self.device if self.is_cuda else (other.device if torch.is_tensor(other) and other.is_cuda else self.device)
+                s = self.to(device=target_dev)
+                o = other.to(device=target_dev) if torch.is_tensor(other) else other
+                return orig_op(s, o)
+            raise r_err
+    return _safe_binop
+
+torch.Tensor.__mul__ = _make_safe_tensor_binop(_orig_tensor_mul)
+torch.Tensor.__rmul__ = _make_safe_tensor_binop(_orig_tensor_rmul)
+torch.Tensor.__add__ = _make_safe_tensor_binop(_orig_tensor_add)
+torch.Tensor.__radd__ = _make_safe_tensor_binop(_orig_tensor_radd)
+torch.Tensor.__sub__ = _make_safe_tensor_binop(_orig_tensor_sub)
+torch.Tensor.__rsub__ = _make_safe_tensor_binop(_orig_tensor_rsub)
+torch.Tensor.__truediv__ = _make_safe_tensor_binop(_orig_tensor_div)
+torch.Tensor.__rtruediv__ = _make_safe_tensor_binop(_orig_tensor_rdiv)
+
+_orig_tensor_mul_ = torch.Tensor.mul_
+_orig_tensor_add_ = torch.Tensor.add_
+_orig_tensor_sub_ = torch.Tensor.sub_
+_orig_tensor_div_ = torch.Tensor.div_
+
+def _make_safe_tensor_inplace_binop(orig_inplace_op):
+    @functools.wraps(orig_inplace_op)
+    def _safe_inplace_binop(self, other, *args, **kwargs):
+        if torch.is_tensor(other):
+            if other.device != self.device:
+                other = other.to(device=self.device)
+            if other.dtype != self.dtype and other.dtype.is_floating_point and self.dtype.is_floating_point:
+                other = other.to(dtype=self.dtype)
+        return orig_inplace_op(self, other, *args, **kwargs)
+    return _safe_inplace_binop
+
+torch.Tensor.mul_ = _make_safe_tensor_inplace_binop(_orig_tensor_mul_)
+torch.Tensor.add_ = _make_safe_tensor_inplace_binop(_orig_tensor_add_)
+torch.Tensor.sub_ = _make_safe_tensor_inplace_binop(_orig_tensor_sub_)
+torch.Tensor.div_ = _make_safe_tensor_inplace_binop(_orig_tensor_div_)
+
+_orig_tensor_addcmul_ = torch.Tensor.addcmul_
+_orig_tensor_addcmul = torch.Tensor.addcmul
+_orig_tensor_addcdiv_ = torch.Tensor.addcdiv_
+
+def _safe_tensor_addcmul_(self, tensor1, tensor2, *, value=1):
+    if torch.is_tensor(tensor1) and tensor1.device != self.device:
+        tensor1 = tensor1.to(device=self.device)
+    if torch.is_tensor(tensor2) and tensor2.device != self.device:
+        tensor2 = tensor2.to(device=self.device)
+    if torch.is_tensor(tensor1) and tensor1.dtype != self.dtype and tensor1.dtype.is_floating_point and self.dtype.is_floating_point:
+        tensor1 = tensor1.to(dtype=self.dtype)
+    if torch.is_tensor(tensor2) and tensor2.dtype != self.dtype and tensor2.dtype.is_floating_point and self.dtype.is_floating_point:
+        tensor2 = tensor2.to(dtype=self.dtype)
+    return _orig_tensor_addcmul_(self, tensor1, tensor2, value=value)
+
+def _safe_tensor_addcmul(self, tensor1, tensor2, *, value=1):
+    if torch.is_tensor(tensor1) and tensor1.device != self.device:
+        tensor1 = tensor1.to(device=self.device)
+    if torch.is_tensor(tensor2) and tensor2.device != self.device:
+        tensor2 = tensor2.to(device=self.device)
+    if torch.is_tensor(tensor1) and tensor1.dtype != self.dtype and tensor1.dtype.is_floating_point and self.dtype.is_floating_point:
+        tensor1 = tensor1.to(dtype=self.dtype)
+    if torch.is_tensor(tensor2) and tensor2.dtype != self.dtype and tensor2.dtype.is_floating_point and self.dtype.is_floating_point:
+        tensor2 = tensor2.to(dtype=self.dtype)
+    return _orig_tensor_addcmul(self, tensor1, tensor2, value=value)
+
+def _safe_tensor_addcdiv_(self, tensor1, tensor2, *, value=1):
+    if torch.is_tensor(tensor1) and tensor1.device != self.device:
+        tensor1 = tensor1.to(device=self.device)
+    if torch.is_tensor(tensor2) and tensor2.device != self.device:
+        tensor2 = tensor2.to(device=self.device)
+    if torch.is_tensor(tensor1) and tensor1.dtype != self.dtype and tensor1.dtype.is_floating_point and self.dtype.is_floating_point:
+        tensor1 = tensor1.to(dtype=self.dtype)
+    if torch.is_tensor(tensor2) and tensor2.dtype != self.dtype and tensor2.dtype.is_floating_point and self.dtype.is_floating_point:
+        tensor2 = tensor2.to(dtype=self.dtype)
+    return _orig_tensor_addcdiv_(self, tensor1, tensor2, value=value)
+
+torch.Tensor.addcmul_ = _safe_tensor_addcmul_
+torch.Tensor.addcmul = _safe_tensor_addcmul
+torch.addcmul = _safe_tensor_addcmul
+torch.Tensor.addcdiv_ = _safe_tensor_addcdiv_
+log_debug("Perisai Sejagat Tensor Arithmetic & In-Place Operators (Cross-Device Auto Harmonizer) berjaya dipasang.")
+
+try:
+    from shared.kernels import vae_ops
+    _orig_scaled_residual = vae_ops.scaled_residual
+    @functools.wraps(_orig_scaled_residual)
+    def _safe_scaled_residual(x_list, scale, residual):
+        first_x = x_list[0] if (x_list and len(x_list) > 0) else None
+        if first_x is not None and torch.is_tensor(first_x):
+            target_dev = first_x.device
+            target_dt = first_x.dtype
+            if scale is not None and torch.is_tensor(scale) and (scale.device != target_dev or scale.dtype != target_dt):
+                scale = scale.to(device=target_dev, dtype=target_dt)
+            if residual is not None and torch.is_tensor(residual) and (residual.device != target_dev or residual.dtype != target_dt):
+                residual = residual.to(device=target_dev, dtype=target_dt)
+        return _orig_scaled_residual(x_list, scale, residual)
+    vae_ops.scaled_residual = _safe_scaled_residual
+except Exception:
+    pass
+
+try:
+    from models.minimax_h3.components import video_autoencoder as v_ae_comp
+    if hasattr(v_ae_comp, "MiniMaxH3VideoRotaryPosEmbed"):
+        _orig_rope_forward = v_ae_comp.MiniMaxH3VideoRotaryPosEmbed.forward
+        @functools.wraps(_orig_rope_forward)
+        def _safe_video_rope_forward(self, position_ids):
+            if hasattr(self, "inv_freq") and torch.is_tensor(self.inv_freq) and self.inv_freq.device != position_ids.device:
+                self.inv_freq = self.inv_freq.to(position_ids.device)
+            return _orig_rope_forward(self, position_ids)
+        v_ae_comp.MiniMaxH3VideoRotaryPosEmbed.forward = _safe_video_rope_forward
+except Exception:
+    pass
+
+try:
+    from models.minimax_h3 import transformer as h3_trans
+    if hasattr(h3_trans, "RotaryEmbedding"):
+        _orig_trans_rope_forward = h3_trans.RotaryEmbedding.forward
+        @functools.wraps(_orig_trans_rope_forward)
+        def _safe_trans_rope_forward(self, position_ids, device):
+            if hasattr(self, "inv_freq") and torch.is_tensor(self.inv_freq) and str(self.inv_freq.device) != str(device):
+                self.inv_freq = self.inv_freq.to(device)
+            return _orig_trans_rope_forward(self, position_ids, device)
+        h3_trans.RotaryEmbedding.forward = _safe_trans_rope_forward
+except Exception:
+    pass
+
+try:
+    from models.ideogram4 import qwen3_vl_transformers as q3vl
+    if hasattr(q3vl, "apply_rotary_pos_emb_vision"):
+        _orig_apply_rotary_pos_emb_vision = q3vl.apply_rotary_pos_emb_vision
+        @functools.wraps(_orig_apply_rotary_pos_emb_vision)
+        def _safe_apply_rotary_pos_emb_vision(q, k, cos, sin):
+            first_t = q[0] if isinstance(q, (list, tuple)) else q
+            if first_t is not None and torch.is_tensor(first_t):
+                target_dev = first_t.device
+                if torch.is_tensor(cos) and cos.device != target_dev:
+                    cos = cos.to(device=target_dev)
+                if torch.is_tensor(sin) and sin.device != target_dev:
+                    sin = sin.to(device=target_dev)
+            return _orig_apply_rotary_pos_emb_vision(q, k, cos, sin)
+        q3vl.apply_rotary_pos_emb_vision = _safe_apply_rotary_pos_emb_vision
+
+    if hasattr(q3vl, "_apply_rotary_inplace"):
+        _orig_apply_rotary_inplace = q3vl._apply_rotary_inplace
+        @functools.wraps(_orig_apply_rotary_inplace)
+        def _safe_apply_rotary_inplace(x, cos, sin, unsqueeze_dim):
+            if torch.is_tensor(x):
+                target_dev = x.device
+                target_dt = x.dtype
+                if torch.is_tensor(cos) and (cos.device != target_dev or cos.dtype != target_dt):
+                    cos = cos.to(device=target_dev, dtype=target_dt)
+                if torch.is_tensor(sin) and (sin.device != target_dev or sin.dtype != target_dt):
+                    sin = sin.to(device=target_dev, dtype=target_dt)
+            return _orig_apply_rotary_inplace(x, cos, sin, unsqueeze_dim)
+        q3vl._apply_rotary_inplace = _safe_apply_rotary_inplace
+except Exception:
+    pass
 
 
 # Pintasan GGUF Proaktif Sejagat: Menapis Berdasarkan Nisbah Lonjakan Memori Fizikal Masa-Nyata
@@ -3669,11 +3999,23 @@ try:
         force_attention = kwargs.get("force_attention", None)
         if force_attention is None:
             active_attn = offload.shared_state.get("_attention")
-            if active_attn is None:
-                active_attn = shared_attn.get_default_attention_mode()
+            if not active_attn:
+                try:
+                    active_attn = shared_attn.get_default_attention_mode()
+                except Exception:
+                    active_attn = "sdpa"
+                offload.shared_state["_attention"] = active_attn
             if active_attn in ("sage", "auto") and getattr(shared_attn, "sageattn2", None) is not None:
                 kwargs["force_attention"] = "sage2"
+            else:
+                kwargs["force_attention"] = active_attn or "sdpa"
         return _orig_pay_attention(qkv_list, *args, **kwargs)
+
+    if "_attention" not in offload.shared_state:
+        try:
+            offload.shared_state["_attention"] = shared_attn.get_default_attention_mode()
+        except Exception:
+            offload.shared_state["_attention"] = "sdpa"
 
     shared_attn.pay_attention = _optimized_pay_attention
     log_debug("Perisai 6b: Universal Dynamic pay_attention (SageAttention 2 SM120 Fast-Path) berjaya dipasang.")
@@ -3787,8 +4129,44 @@ try:
     try:
         from shared.qtypes import scaled_fp8
         _orig_scaled_fp8_linear = scaled_fp8.scaled_fp8_linear
+        
+        # Patch ScaledFP8WeightTensor._linear_fallback secara terus untuk mencegah perbezaan peranti pada out += bias
+        if hasattr(scaled_fp8, "ScaledFP8WeightTensor") and hasattr(scaled_fp8.ScaledFP8WeightTensor, "_linear_fallback"):
+            _orig_linear_fallback = scaled_fp8.ScaledFP8WeightTensor._linear_fallback
+            @classmethod
+            def _safe_linear_fallback(cls, qweight, input, bias=None):
+                if torch.is_tensor(input):
+                    target_dev = input.device
+                    target_dt = input.dtype
+                    if bias is not None and torch.is_tensor(bias):
+                        if bias.device != target_dev or bias.dtype != target_dt:
+                            bias = bias.to(device=target_dev, dtype=target_dt)
+                    if hasattr(qweight, "_data") and torch.is_tensor(qweight._data) and qweight._data.device != target_dev:
+                        try:
+                            qweight = qweight.to(device=target_dev)
+                        except Exception:
+                            pass
+                return _orig_linear_fallback(qweight, input, bias)
+            scaled_fp8.ScaledFP8WeightTensor._linear_fallback = _safe_linear_fallback
+
         @functools.wraps(_orig_scaled_fp8_linear)
         def _safe_scaled_fp8_linear(weight, input, bias=None):
+            if torch.is_tensor(input):
+                target_dev = input.device
+                target_dt = input.dtype
+                if bias is not None and torch.is_tensor(bias):
+                    if bias.device != target_dev or bias.dtype != target_dt:
+                        bias = bias.to(device=target_dev, dtype=target_dt)
+                if hasattr(weight, "_data") and torch.is_tensor(weight._data) and weight._data.device != target_dev:
+                    try:
+                        weight = weight.to(device=target_dev)
+                    except Exception:
+                        pass
+                elif torch.is_tensor(weight) and weight.device != target_dev:
+                    try:
+                        weight = weight.to(device=target_dev)
+                    except Exception:
+                        pass
             if not hasattr(weight, "_force_full_precision_mm") or not hasattr(weight, "_scaled_mm_static_ok"):
                 if hasattr(weight, "dequantize"):
                     try:
@@ -3807,7 +4185,15 @@ try:
                         except Exception:
                             pass
                     return torch.nn.functional.linear(input, w_dec, bias)
-            return _orig_scaled_fp8_linear(weight, input, bias)
+            try:
+                return _orig_scaled_fp8_linear(weight, input, bias)
+            except Exception as sfp8_err:
+                err_s = str(sfp8_err).lower()
+                if "device" in err_s or "same" in err_s or "dtype" in err_s:
+                    log_debug(f"[SCALED_FP8 RESCUE] Ralat peranti/dtype dikesan ({sfp8_err}). Menyahkuantisasi ke F.linear...")
+                    if hasattr(weight, "dequantize"):
+                        return torch.nn.functional.linear(input, weight.dequantize(), bias)
+                raise sfp8_err
         scaled_fp8.scaled_fp8_linear = _safe_scaled_fp8_linear
         log_debug("Perisai ScaledFP8 & WeightQBytesTensor AttributeError Guard berjaya dipasang.")
     except Exception as e:
@@ -3944,7 +4330,7 @@ try:
             reload_h3_video_vae_decoder(self)
 
         # Penyelarasan Peranti: Biarkan MMGP offload menstrim blok decoder ke GPU mengikut keperluan blok demi blok (Sifar Memory Corruption / Sifar Access Violation)
-        pass
+        video_input = args[0] if len(args) > 0 else kwargs.get("latents") or kwargs.get("video") or kwargs.get("x")
 
         # KONTINUUM PEMULIHAN (SSD LATENT CHECKPOINT DUMP):
         # Simpan laten siap 100% denoising ke SSD sebelum fasa VAE bermula.
@@ -4127,7 +4513,19 @@ try:
         a_p = next(self.parameters(), None)
         if a_p is not None and a_p.numel() == 0:
             reload_h3_audio_vae(self)
-        audio_input = args[0] if len(args) > 0 else kwargs.get("audio") or kwargs.get("x")
+        audio_input = args[0] if len(args) > 0 else kwargs.get("audio") or kwargs.get("x") or kwargs.get("latents")
+        if audio_input is not None and torch.is_tensor(audio_input):
+            if audio_input.ndim == 3:
+                # Menyelaras secara automatik latents audio 3D [1, channels, frames] -> 4D stereo [1, channels, 2, frames]
+                audio_input = audio_input.unsqueeze(2).repeat(1, 1, 2, 1)
+                if len(args) > 0:
+                    args = (audio_input,) + args[1:]
+                elif "latents" in kwargs:
+                    kwargs["latents"] = audio_input
+                elif "audio" in kwargs:
+                    kwargs["audio"] = audio_input
+                elif "x" in kwargs:
+                    kwargs["x"] = audio_input
         target_device = (audio_input.device if audio_input is not None and torch.is_tensor(audio_input) else None) or kwargs.get("device") or "cuda"
         try:
             target_dev_obj = torch.device(target_device)
