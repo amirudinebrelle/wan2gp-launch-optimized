@@ -4353,23 +4353,8 @@ try:
                 single_pass_peak = dest_qkv_bytes + interm_bytes + attn_out_bytes + wddm_safe_guard_bytes
 
                 # Syarat Single-Pass Matematik Tulen:
-                # Hanya jika VRAM bebas dikesan di bawah puncak serentak, segarkan cache PyTorch:
-                if (not is_retry) and (effective_free < single_pass_peak):
-                    _diag_free_before = effective_free
-                    _diag_t_flush = time.perf_counter()
-                    flush_vram()
-                    if torch.cuda.is_available():
-                        free_bytes, total_bytes = torch.cuda.mem_get_info()
-                        cached_unused = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
-                        effective_free = free_bytes + max(0, cached_unused)
-                    log_debug(
-                        f"[DIAG RESCUE] Langkah {_h3_diag['step']} Blok {_h3_diag['block_in_step']}: "
-                        f"effective_free={_diag_free_before / 1048576:.1f}MB < puncak={single_pass_peak / 1048576:.1f}MB "
-                        f"-> selepas flush={effective_free / 1048576:.1f}MB, "
-                        f"single_pass={'Ya' if effective_free >= single_pass_peak else 'Tidak'}, "
-                        f"kos={(time.perf_counter() - _diag_t_flush) * 1000.0:.1f}ms"
-                    )
-
+                # Jika VRAM bebas fizikal mencukupi puncak unjuran, laksanakan secara satu laluan penuh pantas.
+                # Jika tidak, pecahan seimbang dinamik (chunking) akan mengambil alih secara selamat tanpa panggilan empty_cache() berulang.
                 can_single_pass = (not is_retry) and (effective_free >= single_pass_peak)
 
                 do_prof = _h3_diag["prof_active"] and not is_retry
@@ -4422,8 +4407,8 @@ try:
                         query, key, value = q_c, k_c, v_c
                 else:
                     # Pecahan seimbang dinamik matematik tulen:
-                    # Baki ruang selamat untuk peruntukan sementara selepas menolak penimbal destinasi Q,K,V dan penimbal WDDM
-                    headroom_for_temp = max(row_bytes, effective_free - dest_qkv_bytes - attn_out_bytes - wddm_safe_guard_bytes)
+                    # Semasa unjuran QKV, attn_out belum wujud. Baki ruang selamat mengambil kira penimbal destinasi Q,K,V serta penimbal keselamatan WDDM:
+                    headroom_for_temp = max(row_bytes, effective_free - dest_qkv_bytes - wddm_safe_guard_bytes)
                     num_chunks = max(2, math.ceil(full_qkv_bytes / max(1, headroom_for_temp)))
                     tokens_per_chunk = math.ceil(seq_len / num_chunks)
                     chunk_tokens = min(seq_len, max(min_compute_tokens, ((tokens_per_chunk + tile_tokens - 1) // tile_tokens) * tile_tokens))
@@ -4713,21 +4698,22 @@ try:
         now = time.perf_counter()
         gap_ms = (now - _h3_diag["last_block_end"]) * 1000.0 if _h3_diag["last_block_end"] is not None else -1.0
         unload_before = _h3_diag["unload_count"]
-        if cuda_ok:
+        is_prof = (blk < 2)
+        _h3_diag["prof_active"] = is_prof
+        if cuda_ok and is_prof:
             try:
                 torch.cuda.synchronize()
             except Exception:
-                flush_vram()
+                pass
         t_blk = time.perf_counter()
 
-        _h3_diag["prof_active"] = blk < 2
         try:
-            if _h3_diag["prof_active"]:
+            if is_prof:
                 res = _profiled_dit_block_forward(self, x_list, temb, segments, rope, residual_signature_elements,
                                                   run_idx=f"L{step} B{blk}")
             else:
                 res = _orig_dit_block_forward(self, x_list, temb, segments, rope, residual_signature_elements)
-            if cuda_ok:
+            if cuda_ok and is_prof:
                 torch.cuda.synchronize()
         except (torch.OutOfMemoryError, torch.AcceleratorError, RuntimeError, Exception) as e_blk:
             err_blk_s = str(e_blk).lower()
@@ -4740,7 +4726,7 @@ try:
                         act.unload_all()
                         flush_vram()
                     res = _orig_dit_block_forward(self, x_list, temb, segments, rope, residual_signature_elements)
-                    if cuda_ok:
+                    if cuda_ok and is_prof:
                         torch.cuda.synchronize()
                 except Exception as e_retry:
                     log_debug(f"[DIAG RESCUE BLOK] Percubaan semula gagal: {e_retry}")
@@ -4752,51 +4738,52 @@ try:
 
         t_end = time.perf_counter()
         _h3_diag["last_block_end"] = t_end
-        try:
-            if cuda_ok:
-                free_b, _tot_b = torch.cuda.mem_get_info()
-                alloc_mb = torch.cuda.memory_allocated() / 1048576
-                res_mb = torch.cuda.memory_reserved() / 1048576
-                peak_mb = torch.cuda.max_memory_allocated() / 1048576
-                torch.cuda.reset_peak_memory_stats()
-                
-                # Rakam denyutan gelombang aktivasi sebenar (Dynamic Activation Breathing Pulse)
-                if peak_mb > alloc_mb:
-                    pulse_mb = peak_mb - alloc_mb
-                    _generation_state["real_act_pulse_mb"] = max(float(_generation_state.get("real_act_pulse_mb", 0.0)), float(pulse_mb))
+        if is_prof:
+            try:
+                if cuda_ok:
+                    free_b, _tot_b = torch.cuda.mem_get_info()
+                    alloc_mb = torch.cuda.memory_allocated() / 1048576
+                    res_mb = torch.cuda.memory_reserved() / 1048576
+                    peak_mb = torch.cuda.max_memory_allocated() / 1048576
+                    torch.cuda.reset_peak_memory_stats()
                     
-                    # Kalibrasi Dinamik Bajet MMGP Selepas Pengukuran Empirikal Blok Pertama (Zero Hardcoding)
-                    if step == 1 and blk == 0 and not _generation_state.get("calibrated_budget"):
-                        _generation_state["calibrated_budget"] = True
-                        try:
-                            act_inst = get_active_mmgp_instance()
-                            if act_inst is not None and hasattr(act_inst, "budgets") and isinstance(act_inst.budgets, dict):
-                                trans_mod = getattr(self, "transformer", None) or self
-                                tuned_b = compute_dynamic_transformer_budget(trans_mod, is_async=True, phase=1)
-                                if tuned_b > act_inst.budgets.get("transformer", 0):
-                                    act_inst.budgets["transformer"] = tuned_b
-                                    act_inst.budgets["*"] = tuned_b
-                                    try:
-                                        towers_names = get_model_towers(act_inst, "transformer")
-                                        if not towers_names:
-                                            import mmgp.offload as mo
-                                            towers_names, _ = mo._detect_main_towers(trans_mod)
-                                            towers_names = [t for t in towers_names if "token_refiner" not in t]
-                                        act_inst.tune_preloading("transformer", tuned_b * 1024 * 1024, towers_names)
-                                    except Exception:
-                                        pass
-                                    log_debug(f"[KALIBRASI DINAMIK MMGP] Bajet VRAM dan jadual pra-muat MMGP dilaras semula secara empirikal mengikut denyutan aktivasi ({pulse_mb:.0f}MB): {tuned_b}MB.")
-                        except Exception as cal_err:
-                            log_debug(f"Notis kalibrasi bajet MMGP: {cal_err}")
-            else:
-                free_b, alloc_mb, res_mb, peak_mb = 0, 0.0, 0.0, 0.0
-            log_debug(
-                f"[BLOK DIAG] L{step} B{blk}: kira={(t_end - t_blk) * 1000.0:.0f}ms | "
-                f"jurang_hook={gap_ms:.0f}ms | unload_all={_h3_diag['unload_count'] - unload_before} | "
-                f"alloc={alloc_mb:.0f}MB puncak={peak_mb:.0f}MB reserved={res_mb:.0f}MB driver_bebas={free_b / 1048576:.0f}MB"
-            )
-        except Exception:
-            pass
+                    # Rakam denyutan gelombang aktivasi sebenar (Dynamic Activation Breathing Pulse)
+                    if peak_mb > alloc_mb:
+                        pulse_mb = peak_mb - alloc_mb
+                        _generation_state["real_act_pulse_mb"] = max(float(_generation_state.get("real_act_pulse_mb", 0.0)), float(pulse_mb))
+                        
+                        # Kalibrasi Dinamik Bajet MMGP Selepas Pengukuran Empirikal Blok Pertama (Zero Hardcoding)
+                        if step == 1 and blk == 0 and not _generation_state.get("calibrated_budget"):
+                            _generation_state["calibrated_budget"] = True
+                            try:
+                                act_inst = get_active_mmgp_instance()
+                                if act_inst is not None and hasattr(act_inst, "budgets") and isinstance(act_inst.budgets, dict):
+                                    trans_mod = getattr(self, "transformer", None) or self
+                                    tuned_b = compute_dynamic_transformer_budget(trans_mod, is_async=True, phase=1)
+                                    if tuned_b > act_inst.budgets.get("transformer", 0):
+                                        act_inst.budgets["transformer"] = tuned_b
+                                        act_inst.budgets["*"] = tuned_b
+                                        try:
+                                            towers_names = get_model_towers(act_inst, "transformer")
+                                            if not towers_names:
+                                                import mmgp.offload as mo
+                                                towers_names, _ = mo._detect_main_towers(trans_mod)
+                                                towers_names = [t for t in towers_names if "token_refiner" not in t]
+                                            act_inst.tune_preloading("transformer", tuned_b * 1024 * 1024, towers_names)
+                                        except Exception:
+                                            pass
+                                        log_debug(f"[KALIBRASI DINAMIK MMGP] Bajet VRAM dan jadual pra-muat MMGP dilaras semula secara empirikal mengikut denyutan aktivasi ({pulse_mb:.0f}MB): {tuned_b}MB.")
+                            except Exception as cal_err:
+                                log_debug(f"Notis kalibrasi bajet MMGP: {cal_err}")
+                else:
+                    free_b, alloc_mb, res_mb, peak_mb = 0, 0.0, 0.0, 0.0
+                log_debug(
+                    f"[BLOK DIAG] L{step} B{blk}: kira={(t_end - t_blk) * 1000.0:.0f}ms | "
+                    f"jurang_hook={gap_ms:.0f}ms | unload_all={_h3_diag['unload_count'] - unload_before} | "
+                    f"alloc={alloc_mb:.0f}MB puncak={peak_mb:.0f}MB reserved={res_mb:.0f}MB driver_bebas={free_b / 1048576:.0f}MB"
+                )
+            except Exception:
+                pass
         return res
 
     def _profiled_dit_block_forward(self, x_list, temb, segments, rope, residual_signature_elements=0, run_idx="?"):
