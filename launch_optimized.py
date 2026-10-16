@@ -1860,20 +1860,28 @@ def compute_dynamic_transformer_budget(transformer_module=None, is_async=True, p
             # Puncak aktivasi DiTBlock fizikal sebenar berasaskan pelaksanaan mikro-chunk QKV:
             # 1. Penimbal destinasi tensor perhatian (Q, K, V):
             dest_qkv_mb = float(((3 if has_combined_qkv else 2) * total_tokens * inner_dim * elem_size) / (1024 * 1024))
-            # 2. Penimbal keluaran attention (attn_out):
+            # 2. Penimbal putaran RoPE (Rotated Q & Rotated K tensor aktif serentak bagi model RoPE seperti MiniMax/Wan/LTX):
+            has_rope = (
+                transformer_module is not None and (
+                    hasattr(transformer_module, "rope") or hasattr(transformer_module, "rope_embedder")
+                    or any("rope" in str(sm).lower() for sm in getattr(transformer_module, "modules", lambda: [])())
+                )
+            )
+            rope_mb = float((2 * total_tokens * inner_dim * elem_size) / (1024 * 1024)) if has_rope else 0.0
+            # 3. Penimbal keluaran attention (attn_out):
             attn_out_mb = float((total_tokens * inner_dim * elem_size) / (1024 * 1024))
-            # 3. Penimbal residual x:
+            # 4. Penimbal residual x:
             residual_mb = float((total_tokens * hidden_dim * elem_size) / (1024 * 1024))
-            # 4. Penimbal chunk kerja sementara unjuran QKV (dinamik mengikut saiz token dan had alokasi selamat GPU):
+            # 5. Penimbal chunk kerja sementara unjuran QKV (dinamik mengikut saiz token dan had alokasi selamat GPU):
             row_bytes = int((3 if has_combined_qkv else 1) * inner_dim * elem_size)
             dyn_chunk_tokens = total_tokens if total_tokens <= 4096 else math.ceil(total_tokens / max(2, math.ceil((total_tokens * row_bytes) / max(1, (total_gpu_mb * 1048576) * 0.08))))
             chunk_work_mb = float((dyn_chunk_tokens * (3 if has_combined_qkv else 1) * inner_dim * elem_size) / (1024 * 1024))
-            # 5. Penimbal enjin attention workspace (SageAttention 2 SM120 natif tanpa matrik N*N):
+            # 6. Penimbal enjin attention workspace (SageAttention 2 SM120 natif tanpa matrik N*N):
             engine_mb = float((total_tokens * inner_dim * elem_size * 0.25) / (1024 * 1024))
             
             # Puncak serentak DiTBlock attention sebenar bagi Single-Pass (Ground-Truth Hardware Physics):
-            # Penimbal destinasi Q, K, V (dest_qkv_mb) + keluaran attention (attn_out_mb) + residual input (residual_mb) + workspace enjin (engine_mb)
-            dit_peak_act_mb = dest_qkv_mb + attn_out_mb + residual_mb + engine_mb
+            # Penimbal destinasi Q, K, V (dest_qkv_mb) + putaran RoPE (rope_mb) + keluaran attention (attn_out_mb) + residual input (residual_mb) + workspace enjin (engine_mb)
+            dit_peak_act_mb = dest_qkv_mb + rope_mb + attn_out_mb + residual_mb + engine_mb
             if attn_headroom_mb > 0:
                 effective_act_headroom_mb = max(attn_headroom_mb, dit_peak_act_mb)
             else:
@@ -1882,7 +1890,7 @@ def compute_dynamic_transformer_budget(transformer_module=None, is_async=True, p
         # Penimbal Keselamatan Pemacu Dinamik & WDDM (100% Zero Hardcoding):
         # Margin keselamatan fizikal mengelakkan WDDM PCIe paging:
         # Serpihan alokator PyTorch sebenar + saiz 1 blok penimbal pemindahan DMA + kuantum perkakasan CUDA
-        wddm_safe_guard_mb = max(256.0, allocator_frag_mb + effective_block_mb + allocator_quantum_mb)
+        wddm_safe_guard_mb = max(320.0, allocator_frag_mb + effective_block_mb * 1.5 + allocator_quantum_mb)
         
         # Kapasiti Bersih Storan Blok Transformer Fizikal (100% Zero Hardcoding, Sifar Dwi-Tolak):
         # Jumlah Memori GPU fizikal (total_gpu_mb) ditolak:
@@ -4918,7 +4926,8 @@ try:
                                 if act_inst is not None and hasattr(act_inst, "budgets") and isinstance(act_inst.budgets, dict):
                                     trans_mod = getattr(self, "transformer", None) or self
                                     tuned_b = compute_dynamic_transformer_budget(trans_mod, is_async=True, phase=1)
-                                    if tuned_b > act_inst.budgets.get("transformer", 0):
+                                    cur_budget = act_inst.budgets.get("transformer", 0)
+                                    if abs(tuned_b - cur_budget) >= 64:
                                         act_inst.budgets["transformer"] = tuned_b
                                         act_inst.budgets["*"] = tuned_b
                                         try:
@@ -4928,9 +4937,13 @@ try:
                                                 towers_names, _ = mo._detect_main_towers(trans_mod)
                                                 towers_names = [t for t in towers_names if "token_refiner" not in t]
                                             act_inst.tune_preloading("transformer", tuned_b * 1024 * 1024, towers_names)
+                                            # Jika bajet dikurangkan kerana denyutan aktivasi tinggi, bersihkan penimbal blok lebihan serta-merta
+                                            if tuned_b < cur_budget:
+                                                act_inst.unload_all()
+                                                flush_vram()
                                         except Exception:
                                             pass
-                                        log_debug(f"[KALIBRASI DINAMIK MMGP] Bajet VRAM dan jadual pra-muat MMGP dilaras semula secara empirikal mengikut denyutan aktivasi ({pulse_mb:.0f}MB): {tuned_b}MB.")
+                                        log_debug(f"[KALIBRASI DINAMIK MMGP] Bajet VRAM dan jadual pra-muat MMGP dilaras semula secara empirikal mengikut denyutan aktivasi ({pulse_mb:.0f}MB): {cur_budget}MB -> {tuned_b}MB.")
                             except Exception as cal_err:
                                 log_debug(f"Notis kalibrasi bajet MMGP: {cal_err}")
                 else:
