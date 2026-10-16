@@ -1970,12 +1970,14 @@ def compute_dynamic_reserved_ram_ratio(target_module=None):
         safe_ratio = max(0.0, min(safe_reservable_bytes / total_bytes, safe_ratio))
         
         # Kelayakan Pinned Memory Fizikal Dinamik Sejagat (Zero Hardcoding):
-        # Pada sistem 32GB dengan model multimodal besar (Text Encoder 14GB + Transformer 8GB + VAE 3GB + OS 11GB = 36GB),
-        # memin model akan mengunci 7.67GB non-pageable RAM yang memaksa sistem melimpah ke Pagefile (30GB RAM 97% tepu).
-        # Oleh itu, Pinned Memory ditutup secara selamat (pinnedMemory=False) sama seperti tetapan asal Profile 4 MMGP,
-        # membolehkan Async Circular Shuttle berjalan pantas melalui MMGP Staging Ring (788MB) tanpa sebarang sekatan paging SSD.
-        can_pin = False
-        safe_ratio = 0.0
+        # Benarkan memin transformer jika RAM fizikal selamat sedia ada sekurang-kurangnya mencukupi untuk blok model,
+        # membolehkan pemindahan DMA berkelajuan tinggi pada sistem 32GB RAM setelah fasa encoding selesai dan Text Encoder dilupuskan.
+        if safe_reservable_bytes >= (min_block_bytes if min_block_bytes > 0 else 1024 * 1024 * 1024):
+            can_pin = True
+            safe_ratio = max(0.10, min(0.50, target_pin_bytes / total_bytes))
+        else:
+            can_pin = False
+            safe_ratio = 0.0
         
         req_mb = (req_bytes / (1024 * 1024)) if req_bytes > 0 else 0
         block_mb = (min_block_bytes / (1024 * 1024)) if min_block_bytes > 0 else 0
@@ -3936,37 +3938,45 @@ try:
                 self._in_transformer_phase = True
                 _orig_use_trans(self)
                 try:
-                    active_inst = get_active_mmgp_instance()
-                    
-                    # 1. Nyahmuat semua modul dorman bukan transformer dari MMGP secara menyeluruh
-                    if active_inst is not None:
-                        for mid in list(active_inst.models.keys()):
-                            if "transformer" not in str(mid).lower():
-                                safe_mmgp_unload(active_inst, mid)
-                                m_entry = active_inst.models.get(mid)
-                                if m_entry is not None:
-                                    setattr(m_entry, "_pinned_bytes", 0)
+                    # 1. Punggah SEMUA komponen pembantu dari pengurus MMGP (shared & private)
+                    offload_candidates = set()
+                    act_inst = get_active_mmgp_instance()
+                    if act_inst is not None:
+                        offload_candidates.add(act_inst)
+                    for attr_name in ("_shared_offloadobj", "_private_offloadobj"):
+                        o = getattr(self, attr_name, None)
+                        if o is not None and hasattr(o, "models"):
+                            offload_candidates.add(o)
 
-                    # 2. Singkirkan bobot modul pembantu pipeline (text_encoder, visual, vae, dll.)
-                    evict_h3_auxiliary_modules(self)
+                    for inst in offload_candidates:
+                        for mid in ("text_encoder", "vision_encoder", "video_encoder", "audio_vae", "latent_upscaler", "vae"):
+                            safe_mmgp_unload(inst, mid)
+                            m_entry = inst.models.get(mid)
+                            if m_entry is not None:
+                                setattr(m_entry, "_pinned_bytes", 0)
+                        if hasattr(inst, "block_items") and isinstance(inst.block_items, dict):
+                            for k in list(inst.block_items.keys()):
+                                if any(x in str(k) for x in ("text_encoder", "vision_encoder")):
+                                    del inst.block_items[k]
 
-                    # 3. Pindahkan sebarang tensor CUDA modul pembantu ke CPU secara mutlak
+                    # 2. True On-Demand: Lupuskan Qwen Text Encoder & Vision Encoder 100% daripada RAM hos
                     te = getattr(self, "text_encoder", None)
                     if te is not None:
                         for sub_m in (getattr(te, "language_model", None), getattr(te, "visual", None), te):
-                            if sub_m is not None and hasattr(sub_m, "parameters"):
-                                for p in sub_m.parameters():
-                                    if p is not None and getattr(p, "is_cuda", False):
-                                        try:
-                                            p.data = p.data.to("cpu")
-                                        except Exception:
-                                            pass
-                                for b in sub_m.buffers():
-                                    if b is not None and getattr(b, "is_cuda", False):
-                                        try:
-                                            b.data = b.data.to("cpu")
-                                        except Exception:
-                                            pass
+                            if sub_m is not None:
+                                if hasattr(sub_m, "parameters"):
+                                    for p in sub_m.parameters():
+                                        if p is not None and hasattr(p, "data"):
+                                            p.data = torch.empty(0, dtype=p.dtype, device='cpu')
+                                if hasattr(sub_m, "buffers"):
+                                    for b in sub_m.buffers():
+                                        if b is not None and hasattr(b, "data"):
+                                            b.data = torch.empty(0, dtype=b.dtype, device='cpu')
+                        self.text_encoder = None
+                        self._text_encoder_needs_reload = True
+                        log_debug("[TRUE ON-DEMAND] Qwen Text Encoder (18GB) dikosongkan 100% daripada RAM hos.")
+
+                    # 3. Alihkan sebarang tensor CUDA modul pembantu yang masih hidup ke CPU
                     for mod_name in ("video_encoder", "video_decoder", "audio_vae", "vae", "latent_upscaler"):
                         mod = getattr(self, mod_name, None)
                         if mod is not None and hasattr(mod, "parameters"):
@@ -4003,7 +4013,7 @@ try:
                     except Exception:
                         pass
 
-                    # 5. Pangkas halaman mmap dorman Text Encoder (14.6GB) daripada set kerja RAM fizikal Windows
+                    # 5. Pangkas halaman working set RAM proses serta-merta ke Windows
                     force_pagefile_push(force_trim=True)
                     trim_current_process_working_set()
 
