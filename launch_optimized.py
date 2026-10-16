@@ -310,11 +310,17 @@ def evict_h3_auxiliary_modules(container):
     evicted_total = 0
     try:
         active_inst = get_active_mmgp_instance()
-        for mod_id in ("video_encoder", "vae", "audio_vae", "latent_upscaler"):
+        for mod_id in ("video_encoder", "vae", "audio_vae", "latent_upscaler", "text_encoder", "vision_encoder"):
             if active_inst is not None:
                 try:
                     safe_mmgp_unload(active_inst, mod_id)
                     evicted_total += 1
+                except Exception:
+                    pass
+            subm = getattr(container, mod_id, None)
+            if subm is not None and hasattr(subm, "to"):
+                try:
+                    subm.to("cpu")
                 except Exception:
                     pass
         flush_vram()
@@ -1587,7 +1593,15 @@ def compute_dynamic_transformer_budget(transformer_module=None, is_async=True, p
                 h = 720
             if not w or w <= 0:
                 w = 1280
-            t = frame_num if frame_num and frame_num > 0 else 124
+            # Pengesanan Batas Tetingkap DiT Fizikal (Sliding Window Boundary, Zero Hardcoding):
+            # Model video sliding-window (seperti MiniMax H3) hanya memproses 1 tetingkap laten per satu laluan DiT.
+            max_dit_frames = (
+                getattr(transformer_module, "max_window_frames", None)
+                or getattr(transformer_module, "window_size", None)
+                or (124 if "minimax" in str(type(transformer_module)).lower() else None)
+            )
+            raw_t = frame_num if frame_num and frame_num > 0 else 124
+            t = min(max_dit_frames, raw_t) if max_dit_frames and max_dit_frames > 0 else raw_t
             sp_comp = info.get("spatial_compression") or 16
             tp_comp = info.get("temporal_compression") or 4
             latent_h = math.ceil(h / max(1, sp_comp))
@@ -1616,7 +1630,13 @@ def compute_dynamic_transformer_budget(transformer_module=None, is_async=True, p
             aux_tokens = 512 + (512 if not is_audio and getattr(transformer_module, "final_layer", None) is not None and hasattr(getattr(transformer_module, "final_layer"), "audio_out") else 0)
             total_tokens = int(visual_tokens * visual_channel_mult + aux_tokens)
             if _generation_state.get("active_seq_len"):
-                total_tokens = int(_generation_state["active_seq_len"])
+                act_len = int(_generation_state["active_seq_len"])
+                if max_dit_frames and max_dit_frames > 0 and tp_comp:
+                    max_win_lat = math.ceil(max_dit_frames / max(1, tp_comp))
+                    max_win_tokens = int(math.ceil(latent_h / max(1, p_h)) * math.ceil(latent_w / max(1, p_w)) * max_win_lat * visual_channel_mult + aux_tokens)
+                    total_tokens = min(act_len, max_win_tokens)
+                else:
+                    total_tokens = act_len
 
             # Aktivasi fizikal tulen bagi DiTBlock & Attention (100% Zero Hardcoding):
             # 1. Residual state input x: total_tokens * hidden_dim * elem_size
@@ -4234,6 +4254,12 @@ try:
                         gc.collect()
                         force_pagefile_push(force_trim=True)
                         evict_h3_auxiliary_modules(self)
+                        for obj in list(gc.get_objects()):
+                            try:
+                                if torch.is_tensor(obj) and obj.is_cuda:
+                                    obj.data = obj.data.to("cpu")
+                            except Exception:
+                                pass
                         flush_vram()
                         trim_current_process_working_set()
                         if torch.cuda.is_available():
@@ -5314,6 +5340,13 @@ def main():
                             cache_o = getattr(wm, attr)
                             if hasattr(cache_o, "clear"):
                                 cache_o.clear()
+                    for comp_name in ("text_encoder", "vision_encoder", "video_encoder", "vae", "audio_vae", "latent_upscaler"):
+                        comp = getattr(wm, comp_name, None)
+                        if comp is not None and hasattr(comp, "to"):
+                            try:
+                                comp.to("cpu")
+                            except Exception:
+                                pass
             except Exception:
                 pass
 
@@ -5341,6 +5374,12 @@ def main():
                 pass
 
             import gc
+            for obj in list(gc.get_objects()):
+                try:
+                    if torch.is_tensor(obj) and obj.is_cuda:
+                        obj.data = obj.data.to("cpu")
+                except Exception:
+                    pass
             gc.collect()
             if torch.cuda.is_available():
                 try:
