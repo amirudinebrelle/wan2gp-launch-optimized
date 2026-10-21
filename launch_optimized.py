@@ -2455,6 +2455,8 @@ def centralized_model_memory_arbiter(
         # 4. Ground-truth Pengiraan Tensor CUDA Hidup Luar Modul (Bukan Blok/Base/LoRA Model Ini)
         if active_live_mb is None:
             mmgp_loaded_mb = 0.0
+            cur_b = None
+            preloaded = ()
             if act is not None and hasattr(act, "blocks_of_modules_sizes"):
                 preloaded = act.preloaded_blocks_per_model.get(main_id, ()) if hasattr(act, "preloaded_blocks_per_model") else ()
                 for b in preloaded:
@@ -4575,6 +4577,12 @@ try:
         # Penyelarasan Peranti: Biarkan MMGP offload menstrim blok decoder ke GPU mengikut keperluan blok demi blok (Sifar Memory Corruption / Sifar Access Violation)
         video_input = args[0] if len(args) > 0 else kwargs.get("latents") or kwargs.get("video") or kwargs.get("x")
 
+        # Sanitasi Laten Dinamik (Anti-NaN / Anti-Black-Screen Shield)
+        if video_input is not None and torch.is_tensor(video_input):
+            if torch.isnan(video_input).any() or torch.isinf(video_input).any():
+                log_debug("[LAUNCHER DEBUG] [NAN/INF HEALING] Laten video mengandungi NaN/Inf sebelum VAE decode. Memulihkan tensor secara dinamik ke ruang selamat.")
+                torch.nan_to_num_(video_input, nan=0.0, posinf=1.0, neginf=-1.0)
+
         # KONTINUUM PEMULIHAN (SSD LATENT CHECKPOINT DUMP):
         # Simpan laten siap 100% denoising ke SSD sebelum fasa VAE bermula.
         recovery_dir = os.path.join("workspaces", "recovery")
@@ -5062,7 +5070,17 @@ try:
         except Exception:
             pass
 
-        return universal_auto_healing_call(_orig_h3_forward, self, *args, **kwargs)
+        res = universal_auto_healing_call(_orig_h3_forward, self, *args, **kwargs)
+        # Sanitasi Keluaran Transformer (Anti-NaN / Anti-Inf Stability Shield)
+        if isinstance(res, (tuple, list)) and len(res) >= 2:
+            v_out, a_out = res[0], res[1]
+            if torch.is_tensor(v_out) and (torch.isnan(v_out).any() or torch.isinf(v_out).any()):
+                log_debug("[LAUNCHER DEBUG] [NAN/INF HEALING] Mengesan nilai tidak sah (NaN/Inf) pada halaju video transformer. Memulihkan tensor secara dinamik...")
+                torch.nan_to_num_(v_out, nan=0.0, posinf=1.0, neginf=-1.0)
+            if torch.is_tensor(a_out) and (torch.isnan(a_out).any() or torch.isinf(a_out).any()):
+                log_debug("[LAUNCHER DEBUG] [NAN/INF HEALING] Mengesan nilai tidak sah (NaN/Inf) pada halaju audio transformer. Memulihkan tensor secara dinamik...")
+                torch.nan_to_num_(a_out, nan=0.0, posinf=1.0, neginf=-1.0)
+        return res
         
     h3_transformer.MiniMaxH3Model.forward = _patched_h3_forward
     log_debug("Perisai 10: MiniMax H3 Token Refiner Auto-Eviction & Proactive Forward Shield berjaya dipasang.")
@@ -5936,7 +5954,7 @@ try:
                 if residual is not None:
                     try:
                         from shared.kernels import ops as denoiser_kernels
-                        res_linear = denoiser_kernels.gated_linear(self.out_proj, output, residual, gate, segments)
+                        res_linear = denoiser_kernels.gated_linear(self.out_proj, [output], residual, gate, segments)
                     except Exception:
                         res_linear = None
                     del output
