@@ -4577,12 +4577,6 @@ try:
         # Penyelarasan Peranti: Biarkan MMGP offload menstrim blok decoder ke GPU mengikut keperluan blok demi blok (Sifar Memory Corruption / Sifar Access Violation)
         video_input = args[0] if len(args) > 0 else kwargs.get("latents") or kwargs.get("video") or kwargs.get("x")
 
-        # Sanitasi Laten Dinamik (Anti-NaN / Anti-Black-Screen Shield)
-        if video_input is not None and torch.is_tensor(video_input):
-            if torch.isnan(video_input).any() or torch.isinf(video_input).any():
-                log_debug("[LAUNCHER DEBUG] [NAN/INF HEALING] Laten video mengandungi NaN/Inf sebelum VAE decode. Memulihkan tensor secara dinamik ke ruang selamat.")
-                torch.nan_to_num_(video_input, nan=0.0, posinf=1.0, neginf=-1.0)
-
         # KONTINUUM PEMULIHAN (SSD LATENT CHECKPOINT DUMP):
         # Simpan laten siap 100% denoising ke SSD sebelum fasa VAE bermula.
         recovery_dir = os.path.join("workspaces", "recovery")
@@ -5070,138 +5064,21 @@ try:
         except Exception:
             pass
 
-        res = universal_auto_healing_call(_orig_h3_forward, self, *args, **kwargs)
-        # Sanitasi Keluaran Transformer (Anti-NaN / Anti-Inf Stability Shield)
-        if isinstance(res, (tuple, list)) and len(res) >= 2:
-            v_out, a_out = res[0], res[1]
-            if torch.is_tensor(v_out) and (torch.isnan(v_out).any() or torch.isinf(v_out).any()):
-                log_debug("[LAUNCHER DEBUG] [NAN/INF HEALING] Mengesan nilai tidak sah (NaN/Inf) pada halaju video transformer. Memulihkan tensor secara dinamik...")
-                torch.nan_to_num_(v_out, nan=0.0, posinf=1.0, neginf=-1.0)
-            if torch.is_tensor(a_out) and (torch.isnan(a_out).any() or torch.isinf(a_out).any()):
-                log_debug("[LAUNCHER DEBUG] [NAN/INF HEALING] Mengesan nilai tidak sah (NaN/Inf) pada halaju audio transformer. Memulihkan tensor secara dinamik...")
-                torch.nan_to_num_(a_out, nan=0.0, posinf=1.0, neginf=-1.0)
-        return res
+        return universal_auto_healing_call(_orig_h3_forward, self, *args, **kwargs)
         
     h3_transformer.MiniMaxH3Model.forward = _patched_h3_forward
     log_debug("Perisai 10: MiniMax H3 Token Refiner Auto-Eviction & Proactive Forward Shield berjaya dipasang.")
 
-    # --------------------------------------------------------------------------
-    # --------------------------------------------------------------------------
-    # PERISAI 10b: Universal Aspect-Ratio & Cutout Harmonizer for Reference Images
-    # Memelihara perkadaran geometri subjek (anti-herotan / anti-fat) & auto-crop cutout lutsinar (alpha)
-    # Merangkumi MiniMax H3 (pipeline._prepare_image_reference) dan Wan2GP (utils.fit_image_into_canvas)
-    # --------------------------------------------------------------------------
+    # ----------------------------------------------------------------------
+    # PERISAI 14: MiniMax H3 Universal Phase Lifecycle Manager (Zero Hardcode)
+    # Load When Needed, Unload When Done:
+    # 1. Pengekodan Teks/Visi Selesai -> Nyahmuat Qwen3-VL 32B (text_encoder/vision_encoder) serta-merta
+    #    dan tolak RAM dorman ke Windows Pagefile.
+    # 2. Denoising Selesai -> Nyahmuat Transformer 100% daripada VRAM sebelum VAE / audio_vae / Whisper dimuatkan.
+    # 3. Penjanaan Selesai -> Nyahmuat VAE/Audio VAE dan segarkan VRAM/RAM hos.
+    # ----------------------------------------------------------------------
     try:
         import models.minimax_h3.pipeline as h3_pipe
-        from PIL import Image as PIL_Image
-        import numpy as np_harmonizer
-
-        def _crop_transparent_margins(img, margin_ratio=0.04):
-            """Mengesan saluran alpha dan memotong ruang kosong lutsinar di sekeliling subjek secara dinamik."""
-            if not isinstance(img, PIL_Image.Image):
-                return img
-            has_alpha = False
-            if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in getattr(img, "info", {})):
-                img = img.convert("RGBA")
-                has_alpha = True
-            if has_alpha:
-                alpha = np_harmonizer.array(img.split()[-1])
-                non_zero = np_harmonizer.where(alpha > 15)
-                if len(non_zero[0]) > 0:
-                    y_min, y_max = int(non_zero[0].min()), int(non_zero[0].max())
-                    x_min, x_max = int(non_zero[1].min()), int(non_zero[1].max())
-                    sub_w = x_max - x_min
-                    sub_h = y_max - y_min
-                    total_area = img.width * img.height
-                    # Jika subjek merangkumi kurang daripada 95% kanvas (wujud ruang kosong lutsinar)
-                    if (sub_w * sub_h) < 0.95 * total_area:
-                        pad_y = int(round(sub_h * margin_ratio))
-                        pad_x = int(round(sub_w * margin_ratio))
-                        y_min_pad = max(0, y_min - pad_y)
-                        y_max_pad = min(img.height, y_max + pad_y)
-                        x_min_pad = max(0, x_min - pad_x)
-                        x_max_pad = min(img.width, x_max + pad_x)
-                        img = img.crop((x_min_pad, y_min_pad, x_max_pad, y_max_pad))
-            return img
-
-        def _universal_harmonize_pil(image, target_width, target_height, neutral_bg=(128, 128, 128)):
-            """Penyelarasan universal nisbah bidang & imej rujukan tanpa herotan (anti-fat)."""
-            if image is None:
-                return None
-            if not isinstance(image, PIL_Image.Image):
-                image = PIL_Image.fromarray(np_harmonizer.asarray(image).astype(np_harmonizer.uint8))
-
-            # 1. Pangkas sempadan lutsinar jika ada
-            img = _crop_transparent_margins(image)
-
-            has_alpha = img.mode in ("RGBA", "LA")
-            img_w, img_h = img.size
-            if img_w <= 0 or img_h <= 0 or target_width <= 0 or target_height <= 0:
-                return image
-
-            video_ratio = target_width / target_height
-            img_ratio = img_w / img_h
-
-            # Sekiranya tiada alpha dan nisbah sudah sepadan (sisihan <= 2%)
-            if not has_alpha and abs(img_ratio - video_ratio) <= 0.02:
-                return img.convert("RGB").resize((target_width, target_height), PIL_Image.Resampling.LANCZOS)
-
-            # 2. Skala berkadar seragam (uniform scale) bagi mengekalkan geometri tepat
-            scale = min(target_width / img_w, target_height / img_h)
-            fit_w = max(1, int(round(img_w * scale)))
-            fit_h = max(1, int(round(img_h * scale)))
-            fitted_img = img.resize((fit_w, fit_h), PIL_Image.Resampling.LANCZOS)
-
-            # 3. Letakkan di atas kanvas neutral (128, 128, 128 - seimbang dalam ruang latent VAE [0.0])
-            canvas = PIL_Image.new("RGB", (target_width, target_height), neutral_bg)
-            top = (target_height - fit_h) // 2
-            left = (target_width - fit_w) // 2
-
-            if has_alpha:
-                canvas.paste(fitted_img.convert("RGB"), (left, top), fitted_img.split()[-1])
-            else:
-                canvas.paste(fitted_img.convert("RGB"), (left, top))
-
-            log_debug(f"[ASPECT & CUTOUT HARMONIZER] Imej rujukan ({img_w}x{img_h}, nisbah {img_ratio:.3f}) diselaraskan secara selamat ke kanvas sasaran ({target_width}x{target_height}, nisbah {video_ratio:.3f}) [Pad top={top}, left={left}].")
-            return canvas
-
-        _orig_prepare_img_ref = h3_pipe.MiniMaxH3Pipeline._prepare_image_reference
-
-        @functools.wraps(_orig_prepare_img_ref)
-        def _harmonized_prepare_image_reference(self, image, target_width, target_height, image_refs_relative_size):
-            if image is None:
-                return None
-            harmonized = _universal_harmonize_pil(image, target_width, target_height)
-            return _orig_prepare_img_ref(self, harmonized, target_width, target_height, image_refs_relative_size)
-
-        h3_pipe.MiniMaxH3Pipeline._prepare_image_reference = _harmonized_prepare_image_reference
-
-        # Pasang juga pada shared.utils.utils.fit_image_into_canvas untuk Wan2.1 / Z-Image / model lain
-        try:
-            import shared.utils.utils as shared_utils
-            _orig_fit_canvas = shared_utils.fit_image_into_canvas
-
-            @functools.wraps(_orig_fit_canvas)
-            def _harmonized_fit_image_into_canvas(ref_img, image_size, *args, **kwargs):
-                if isinstance(ref_img, PIL_Image.Image):
-                    ref_img = _crop_transparent_margins(ref_img)
-                return _orig_fit_canvas(ref_img, image_size, *args, **kwargs)
-
-            shared_utils.fit_image_into_canvas = _harmonized_fit_image_into_canvas
-            log_debug("[ASPECT & CUTOUT HARMONIZER] Pintasan sejagat fit_image_into_canvas untuk model Wan2.1/Z-Image berjaya dipasang.")
-        except Exception as e_fit:
-            log_debug(f"[ASPECT & CUTOUT HARMONIZER] Amaran: Pintasan fit_image_into_canvas terlepas: {e_fit}")
-
-        log_debug("Perisai 10b: Universal Aspect-Ratio & Cutout Harmonizer (Anti-Fat/Distortion & Alpha Crop Shield) berjaya dipasang.")
-
-        # ----------------------------------------------------------------------
-        # PERISAI 14: MiniMax H3 Universal Phase Lifecycle Manager (Zero Hardcode)
-        # Load When Needed, Unload When Done:
-        # 1. Pengekodan Teks/Visi Selesai -> Nyahmuat Qwen3-VL 32B (text_encoder/vision_encoder) serta-merta
-        #    dan tolak RAM dorman ke Windows Pagefile.
-        # 2. Denoising Selesai -> Nyahmuat Transformer 100% daripada VRAM sebelum VAE / audio_vae / Whisper dimuatkan.
-        # 3. Penjanaan Selesai -> Nyahmuat VAE/Audio VAE dan segarkan VRAM/RAM hos.
-        # ----------------------------------------------------------------------
         if not getattr(h3_pipe, "_smart_lifecycle_patched", False):
             pipeline_cls = h3_pipe.MiniMaxH3Pipeline
             _orig_pipe_init = pipeline_cls.__init__
@@ -6103,18 +5980,6 @@ try:
                 if _generation_state.get("tuned_seq_len") != act_tokens:
                     _generation_state["tuned_seq_len"] = act_tokens
                     log_debug(f"[ADAPTASI ON-THE-FLY] Geometri tensor dikesan: tokens={act_tokens}, dim={act_hidden}, elem_bytes={act_elem}")
-                    try:
-                        act_inst = get_active_mmgp_instance()
-                        if act_inst is not None and hasattr(act_inst, "budgets") and isinstance(act_inst.budgets, dict):
-                            cur_b = act_inst.budgets.get("transformer", 0)
-                            trans_mod = act_inst.models.get("transformer") if hasattr(act_inst, "models") else None
-                            arb_res = centralized_model_memory_arbiter(trans_mod, model_role="transformer", active_tokens=act_tokens)
-                            safe_b = arb_res["budget_mb"]
-                            if safe_b < cur_b or (cur_b == 0 and safe_b > 0):
-                                apply_mmgp_budget_and_tune(act_inst, "transformer", safe_b, target_model=trans_mod, unload_first=True)
-                                log_debug(f"[ARBITER PUSAT PROAKTIF] Bajet MMGP dilaras sebelum Blok 0: {cur_b}MB -> {safe_b}MB ({arb_res['mode']}, tokens={act_tokens}).")
-                    except Exception as arb_err:
-                        log_debug(f"Notis pelarasan arbiter proaktif blok 0: {arb_err}")
 
         # Jurang antara tamat blok sebelumnya dan mula blok ini = kos hook MMGP (muat/punggah berat)
         now = time.perf_counter()
@@ -6186,68 +6051,6 @@ try:
                         f"jurang_hook={gap_ms:.0f}ms | unload_all={_h3_diag['unload_count'] - unload_before} | "
                         f"alloc={alloc_mb:.0f}MB puncak={peak_mb:.0f}MB reserved={res_mb:.0f}MB driver_bebas={cur_free_mb:.0f}MB"
                     )
-
-                    # ------------------------------------------------------------------
-                    # PENGURUS ANJAL DWI-ARAH GELUNG TERTUTUP (Closed-Loop Elastic Guard)
-                    # Berasaskan Margin Puncak Fizikal Sebenar (peak_physical_margin_mb) & VMM Spillover
-                    # ------------------------------------------------------------------
-                    act_inst = get_active_mmgp_instance()
-                    if act_inst is not None and hasattr(act_inst, "budgets") and isinstance(act_inst.budgets, dict):
-                        trans_mod = act_inst.models.get("transformer") if hasattr(act_inst, "models") else None
-                        cur_budget = act_inst.budgets.get("transformer", 0)
-                        eff_blk_mb = 0.0
-                        mmgp_base_mb = 0.0
-                        if hasattr(act_inst, "blocks_of_modules_sizes") and act_inst.blocks_of_modules_sizes:
-                            main_id = getattr(act_inst, "main_model_id", "transformer")
-                            mmgp_base_mb = act_inst.blocks_of_modules_sizes.get(main_id, 0.0) / 1048576.0
-                            b_szs = [
-                                sz / 1048576.0 for k, sz in act_inst.blocks_of_modules_sizes.items()
-                                if k.startswith(main_id + "/") and "token_refiner" not in k
-                            ]
-                            if b_szs:
-                                eff_blk_mb = max(b_szs)
-                        if eff_blk_mb <= 0:
-                            eff_blk_mb = tot_gpu_mb * 0.025
-
-                        # Ambang Fizikal Dinamik (100% Zero Hardcoding):
-                        # 1. Ambang Kritikal: Margin minimum antara puncak aktivasi (peak_mb) dan siling fizikal (cur_free_mb + res_mb)
-                        critical_peak_margin_mb = (tot_gpu_mb * 0.035) + (eff_blk_mb * 0.75)
-                        # 2. Ambang Pengembangan: Memerlukan ruang untuk critical_peak_margin_mb + pembundaran alokator (~9% denyutan) + 1.15x blok
-                        obs_pulse = float(_generation_state.get("real_act_pulse_mb", pulse_mb))
-                        expansion_peak_margin_mb = critical_peak_margin_mb + (obs_pulse * 0.09) + (eff_blk_mb * 1.15)
-                        min_shuttle_budget_mb = int(mmgp_base_mb + (2.25 * eff_blk_mb))
-
-                        # A. STEP-DOWN KECEMASAN / KALIBRASI ANTI-SPILLOVER (Apabila VMM Spillover > 0 atau Margin Puncak < Kritikal)
-                        if (vmm_spill_mb > 0 or peak_physical_margin_mb < critical_peak_margin_mb) and _generation_state.get("last_step_down") != step:
-                            _generation_state["last_step_down"] = step
-                            _generation_state["vmm_spill_detected"] = (vmm_spill_mb > 0)
-                            deficit_mb = max(vmm_spill_mb, critical_peak_margin_mb - peak_physical_margin_mb)
-                            blocks_to_drop = max(1, math.ceil(deficit_mb / max(1.0, eff_blk_mb)))
-                            new_b = max(min_shuttle_budget_mb, int(cur_budget - (blocks_to_drop * eff_blk_mb)))
-                            if step == 1 and blk == 0 and not _generation_state.get("calibrated_budget"):
-                                _generation_state["calibrated_budget"] = True
-                                arb_cal = centralized_model_memory_arbiter(trans_mod, model_role="transformer")
-                                new_b = min(new_b, arb_cal["budget_mb"])
-                            if new_b < cur_budget:
-                                apply_mmgp_budget_and_tune(act_inst, "transformer", new_b, target_model=trans_mod, unload_first=True)
-                                log_debug(
-                                    f"[ELASTIC GUARD STEP-DOWN] Spillover={vmm_spill_mb:.0f}MB, MarginPuncak={peak_physical_margin_mb:.0f}MB "
-                                    f"(< ambang selamat {critical_peak_margin_mb:.0f}MB). Bajet MMGP dikurangkan {blocks_to_drop} blok: "
-                                    f"{cur_budget}MB -> {new_b}MB (Langkah {step} Blok {blk})."
-                                )
-
-                        # B. STEP-UP ANJAL (Hanya pada Blok 0 jika tiada spillover dan Margin Puncak melepasi Ambang Pengembangan)
-                        elif blk == 0 and step > 1 and vmm_spill_mb == 0 and peak_physical_margin_mb > expansion_peak_margin_mb and _generation_state.get("last_step_down") != step:
-                            info_mod = inspect_model_data(trans_mod)
-                            t_layers = info_mod.get("layers", 0) or len(b_szs)
-                            max_allowed_budget_mb = int(mmgp_base_mb + ((t_layers + 1.25) * eff_blk_mb))
-                            if cur_budget + eff_blk_mb <= max_allowed_budget_mb:
-                                new_b = int(cur_budget + eff_blk_mb)
-                                apply_mmgp_budget_and_tune(act_inst, "transformer", new_b, target_model=trans_mod, unload_first=True)
-                                log_debug(
-                                    f"[ELASTIC GUARD STEP-UP] MarginPuncak={peak_physical_margin_mb:.0f}MB (> ambang pengembangan {expansion_peak_margin_mb:.0f}MB). "
-                                    f"Bajet MMGP ditambah 1 blok: {cur_budget}MB -> {new_b}MB (Langkah {step} Blok {blk})."
-                                )
             except Exception:
                 pass
         return res
