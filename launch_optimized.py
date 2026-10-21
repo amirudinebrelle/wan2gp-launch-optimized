@@ -5068,12 +5068,84 @@ try:
     log_debug("Perisai 10: MiniMax H3 Token Refiner Auto-Eviction & Proactive Forward Shield berjaya dipasang.")
 
     # --------------------------------------------------------------------------
-    # PERISAI 10b: Universal Aspect-Ratio Harmonizer for MiniMax H3 Reference Images
-    # Memelihara perkadaran geometri subjek (manusia, objek, landskap) tanpa herotan
+    # --------------------------------------------------------------------------
+    # PERISAI 10b: Universal Aspect-Ratio & Cutout Harmonizer for Reference Images
+    # Memelihara perkadaran geometri subjek (anti-herotan / anti-fat) & auto-crop cutout lutsinar (alpha)
+    # Merangkumi MiniMax H3 (pipeline._prepare_image_reference) dan Wan2GP (utils.fit_image_into_canvas)
     # --------------------------------------------------------------------------
     try:
         import models.minimax_h3.pipeline as h3_pipe
         from PIL import Image as PIL_Image
+        import numpy as np_harmonizer
+
+        def _crop_transparent_margins(img, margin_ratio=0.04):
+            """Mengesan saluran alpha dan memotong ruang kosong lutsinar di sekeliling subjek secara dinamik."""
+            if not isinstance(img, PIL_Image.Image):
+                return img
+            has_alpha = False
+            if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in getattr(img, "info", {})):
+                img = img.convert("RGBA")
+                has_alpha = True
+            if has_alpha:
+                alpha = np_harmonizer.array(img.split()[-1])
+                non_zero = np_harmonizer.where(alpha > 15)
+                if len(non_zero[0]) > 0:
+                    y_min, y_max = int(non_zero[0].min()), int(non_zero[0].max())
+                    x_min, x_max = int(non_zero[1].min()), int(non_zero[1].max())
+                    sub_w = x_max - x_min
+                    sub_h = y_max - y_min
+                    total_area = img.width * img.height
+                    # Jika subjek merangkumi kurang daripada 95% kanvas (wujud ruang kosong lutsinar)
+                    if (sub_w * sub_h) < 0.95 * total_area:
+                        pad_y = int(round(sub_h * margin_ratio))
+                        pad_x = int(round(sub_w * margin_ratio))
+                        y_min_pad = max(0, y_min - pad_y)
+                        y_max_pad = min(img.height, y_max + pad_y)
+                        x_min_pad = max(0, x_min - pad_x)
+                        x_max_pad = min(img.width, x_max + pad_x)
+                        img = img.crop((x_min_pad, y_min_pad, x_max_pad, y_max_pad))
+            return img
+
+        def _universal_harmonize_pil(image, target_width, target_height, neutral_bg=(128, 128, 128)):
+            """Penyelarasan universal nisbah bidang & imej rujukan tanpa herotan (anti-fat)."""
+            if image is None:
+                return None
+            if not isinstance(image, PIL_Image.Image):
+                image = PIL_Image.fromarray(np_harmonizer.asarray(image).astype(np_harmonizer.uint8))
+
+            # 1. Pangkas sempadan lutsinar jika ada
+            img = _crop_transparent_margins(image)
+
+            has_alpha = img.mode in ("RGBA", "LA")
+            img_w, img_h = img.size
+            if img_w <= 0 or img_h <= 0 or target_width <= 0 or target_height <= 0:
+                return image
+
+            video_ratio = target_width / target_height
+            img_ratio = img_w / img_h
+
+            # Sekiranya tiada alpha dan nisbah sudah sepadan (sisihan <= 2%)
+            if not has_alpha and abs(img_ratio - video_ratio) <= 0.02:
+                return img.convert("RGB").resize((target_width, target_height), PIL_Image.Resampling.LANCZOS)
+
+            # 2. Skala berkadar seragam (uniform scale) bagi mengekalkan geometri tepat
+            scale = min(target_width / img_w, target_height / img_h)
+            fit_w = max(1, int(round(img_w * scale)))
+            fit_h = max(1, int(round(img_h * scale)))
+            fitted_img = img.resize((fit_w, fit_h), PIL_Image.Resampling.LANCZOS)
+
+            # 3. Letakkan di atas kanvas neutral (128, 128, 128 - seimbang dalam ruang latent VAE [0.0])
+            canvas = PIL_Image.new("RGB", (target_width, target_height), neutral_bg)
+            top = (target_height - fit_h) // 2
+            left = (target_width - fit_w) // 2
+
+            if has_alpha:
+                canvas.paste(fitted_img.convert("RGB"), (left, top), fitted_img.split()[-1])
+            else:
+                canvas.paste(fitted_img.convert("RGB"), (left, top))
+
+            log_debug(f"[ASPECT & CUTOUT HARMONIZER] Imej rujukan ({img_w}x{img_h}, nisbah {img_ratio:.3f}) diselaraskan secara selamat ke kanvas sasaran ({target_width}x{target_height}, nisbah {video_ratio:.3f}) [Pad top={top}, left={left}].")
+            return canvas
 
         _orig_prepare_img_ref = h3_pipe.MiniMaxH3Pipeline._prepare_image_reference
 
@@ -5081,43 +5153,28 @@ try:
         def _harmonized_prepare_image_reference(self, image, target_width, target_height, image_refs_relative_size):
             if image is None:
                 return None
-            img = h3_pipe._to_pil(image)
-            img_w, img_h = img.size
-            if img_w <= 0 or img_h <= 0 or target_width <= 0 or target_height <= 0:
-                return _orig_prepare_img_ref(self, image, target_width, target_height, image_refs_relative_size)
-
-            video_ratio = target_width / target_height
-            img_ratio = img_w / img_h
-
-            # Sekiranya nisbah imej berbeza ketara dengan nisbah video (>4% deviasi)
-            if abs(img_ratio - video_ratio) > 0.04:
-                # Skala berkadar seragam (uniform scale) tanpa herotan bentuk
-                scale = min(target_width / img_w, target_height / img_h)
-                fit_w = max(1, int(round(img_w * scale)))
-                fit_h = max(1, int(round(img_h * scale)))
-                fitted_img = img.resize((fit_w, fit_h), PIL_Image.Resampling.LANCZOS)
-
-                # Dapatkan warna latar belakang (jika ada alpha / transparent, atau warna purata sempadan)
-                bg_color = (255, 255, 255)
-                if getattr(img, "mode", "") == "RGBA":
-                    # Letakkan ke atas kanvas putih neutral
-                    canvas = PIL_Image.new("RGB", (target_width, target_height), (255, 255, 255))
-                    top = (target_height - fit_h) // 2
-                    left = (target_width - fit_w) // 2
-                    canvas.paste(fitted_img, (left, top), fitted_img)
-                else:
-                    canvas = PIL_Image.new("RGB", (target_width, target_height), (255, 255, 255))
-                    top = (target_height - fit_h) // 2
-                    left = (target_width - fit_w) // 2
-                    canvas.paste(fitted_img, (left, top))
-
-                log_debug(f"[ASPECT HARMONIZER] Imej rujukan ({img_w}x{img_h}, nisbah {img_ratio:.3f}) diselaraskan secara selamat ke kanvas sasaran ({target_width}x{target_height}, nisbah {video_ratio:.3f}).")
-                return _orig_prepare_img_ref(self, canvas, target_width, target_height, image_refs_relative_size)
-
-            return _orig_prepare_img_ref(self, image, target_width, target_height, image_refs_relative_size)
+            harmonized = _universal_harmonize_pil(image, target_width, target_height)
+            return _orig_prepare_img_ref(self, harmonized, target_width, target_height, image_refs_relative_size)
 
         h3_pipe.MiniMaxH3Pipeline._prepare_image_reference = _harmonized_prepare_image_reference
-        log_debug("Perisai 10b: Universal Aspect-Ratio Harmonizer (Anti-Fat/Distortion Shield) berjaya dipasang.")
+
+        # Pasang juga pada shared.utils.utils.fit_image_into_canvas untuk Wan2.1 / Z-Image / model lain
+        try:
+            import shared.utils.utils as shared_utils
+            _orig_fit_canvas = shared_utils.fit_image_into_canvas
+
+            @functools.wraps(_orig_fit_canvas)
+            def _harmonized_fit_image_into_canvas(ref_img, image_size, *args, **kwargs):
+                if isinstance(ref_img, PIL_Image.Image):
+                    ref_img = _crop_transparent_margins(ref_img)
+                return _orig_fit_canvas(ref_img, image_size, *args, **kwargs)
+
+            shared_utils.fit_image_into_canvas = _harmonized_fit_image_into_canvas
+            log_debug("[ASPECT & CUTOUT HARMONIZER] Pintasan sejagat fit_image_into_canvas untuk model Wan2.1/Z-Image berjaya dipasang.")
+        except Exception as e_fit:
+            log_debug(f"[ASPECT & CUTOUT HARMONIZER] Amaran: Pintasan fit_image_into_canvas terlepas: {e_fit}")
+
+        log_debug("Perisai 10b: Universal Aspect-Ratio & Cutout Harmonizer (Anti-Fat/Distortion & Alpha Crop Shield) berjaya dipasang.")
 
         # ----------------------------------------------------------------------
         # PERISAI 14: MiniMax H3 Universal Phase Lifecycle Manager (Zero Hardcode)
