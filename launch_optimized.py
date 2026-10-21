@@ -5487,11 +5487,6 @@ try:
                 def __iter__(self):
                     for item in self._tqdm:
                         yield item
-                        try:
-                            gc.collect()
-                            trim_current_process_working_set()
-                        except Exception:
-                            pass
 
                 def __len__(self):
                     return len(self._tqdm)
