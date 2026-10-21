@@ -416,7 +416,6 @@ class CentralizedUniversalLifecycleManager:
                 for trans_name in ("transformer", "transformer2", "model", "model2"):
                     safe_mmgp_unload(act, trans_name)
             flush_vram()
-            trim_current_process_working_set()
             self.log_telemetry_snapshot("FASA 2 TAMAT", "Transformer dipindahkan dari VRAM, VRAM 100% lapang untuk VAE Decode.")
 
         elif new_phase == "PHASE_IDLE":
@@ -806,158 +805,44 @@ def set_active_mmgp_instance(inst):
         pass
 
 def safe_mmgp_unload(active_instance, target_key):
-    """Memunggah sebarang model atau blok MMGP secara menyeluruh dan kalis ralat (Zero KeyError & Zero Residual VRAM)."""
+    """Memunggah sebarang model atau blok MMGP secara selamat tanpa memusnahkan penimbal staging ring, mmap, atau slot views."""
     if active_instance is None:
         active_instance = get_active_mmgp_instance()
     if active_instance is None or not hasattr(active_instance, "models") or not active_instance.models:
         return
     try:
         if target_key is None or target_key == "all":
-            # 1. Pulihkan integriti model ID: pastikan SEMUA model berdaftar wujud dalam active_models_ids
-            # Ini menghapuskan punca baki VRAM 1242.7MB (apabila text_encoder tercicir dari active_models_ids)
-            all_mids = list(active_instance.models.keys())
-            if hasattr(active_instance, "active_models_ids"):
-                active_instance.active_models_ids = list(all_mids)
-            if hasattr(active_instance, "active_models"):
-                active_instance.active_models = [active_instance.models[m] for m in all_mids if m in active_instance.models]
-
-            # 2. Panggil unload_all standard MMGP yang kini merangkumi SEMUA model berdaftar
             try:
                 if hasattr(active_instance, "unload_all"):
                     active_instance.unload_all()
             except Exception as e_unl:
                 log_debug(f"Pengecualian semasa inst.unload_all: {e_unl}")
-
-            # 3. Sapuan Menyeluruh Tambahan (Fail-Safe Pass): Pastikan setiap model dan blok dinyahmuat secara mutlak
-            for mid in all_mids:
+            if hasattr(active_instance, "ring") and active_instance.ring is not None and hasattr(active_instance.ring, "reset"):
                 try:
-                    active_instance.gpu_unload_blocks(mid, None)
+                    active_instance.ring.reset()
                 except Exception:
                     pass
-                if hasattr(active_instance, "preloaded_blocks_per_model"):
-                    for b in list(active_instance.preloaded_blocks_per_model.get(mid, ())):
-                        try:
-                            active_instance.gpu_unload_blocks(mid, b)
-                        except Exception:
-                            pass
-                if hasattr(active_instance, "loaded_blocks"):
-                    cur_b = active_instance.loaded_blocks.get(mid)
-                    if cur_b is not None:
-                        try:
-                            active_instance.gpu_unload_blocks(mid, cur_b)
-                        except Exception:
-                            pass
-                        active_instance.loaded_blocks[mid] = None
-                if hasattr(active_instance, "inflight"):
-                    for entry in [e for e in list(active_instance.inflight.keys()) if e.startswith(mid + "/")]:
-                        try:
-                            active_instance.gpu_unload_blocks(mid, entry[len(mid) + 1:])
-                        except Exception:
-                            pass
-
-            if hasattr(active_instance, "blocks_of_modules") and active_instance.blocks_of_modules:
-                for entry_name in list(active_instance.blocks_of_modules.keys()):
-                    try:
-                        if "/" in entry_name:
-                            m_id, b_name = entry_name.split("/", 1)
-                            active_instance.gpu_unload_blocks(m_id, b_name)
-                        else:
-                            active_instance.gpu_unload_blocks(entry_name, None)
-                    except Exception:
-                        pass
-
-            # 4. Bersihkan penimbal block_slots, slot_views, cuda_graphs & staging ring
-            if hasattr(active_instance, "block_slots"):
-                try:
-                    for slots in list(active_instance.block_slots.values()):
-                        if slots:
-                            for s in slots:
-                                if isinstance(s, list) and len(s) > 0 and s[0] is not None:
-                                    s[0] = None
-                    active_instance.block_slots.clear()
-                except Exception:
-                    pass
-            if hasattr(active_instance, "slot_views"):
-                try:
-                    active_instance.slot_views.clear()
-                except Exception:
-                    pass
-            if hasattr(active_instance, "auto_preload") and active_instance.auto_preload is not None:
-                try:
-                    active_instance.auto_preload.on_unload(all_mids)
-                except Exception:
-                    pass
-            # 5. Pindahkan sebarang parameter dan buffer CUDA model berdaftar ke CPU secara selamat
-            for mid in all_mids:
-                m_obj = active_instance.models.get(mid)
-                if m_obj is not None and hasattr(m_obj, "parameters"):
-                    for p in m_obj.parameters():
-                        if p is not None and getattr(p, "is_cuda", False):
-                            try:
-                                p.data = p.data.to("cpu")
-                            except Exception:
-                                pass
-                    for b in m_obj.buffers():
-                        if b is not None and getattr(b, "is_cuda", False):
-                            try:
-                                b.data = b.data.to("cpu")
-                            except Exception:
-                                pass
-            if hasattr(active_instance, "cuda_graphs"):
-                try:
-                    for graphs in list(active_instance.cuda_graphs.values()):
-                        if hasattr(graphs, "clear"):
-                            graphs.clear()
-                    active_instance.cuda_graphs.clear()
-                except Exception:
-                    pass
-            if hasattr(active_instance, "_release_ring"):
-                try:
-                    active_instance._release_ring()
-                except Exception:
-                    pass
-            elif hasattr(active_instance, "ring") and active_instance.ring is not None:
-                try:
-                    active_instance.ring.close()
-                    active_instance.ring = None
-                except Exception:
-                    pass
-
-            if hasattr(active_instance, "active_models_ids"):
-                active_instance.active_models_ids.clear()
-            if hasattr(active_instance, "active_models"):
-                active_instance.active_models.clear()
-
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
             flush_vram()
-            try:
-                from mmgp.allocator import ram as mmgp_ram
-                mmgp_ram.release()
-            except Exception:
-                pass
-            try:
-                from shared.cuda_memory import release_ram_cache
-                release_ram_cache()
-            except Exception:
-                pass
             return
 
         if "/" in target_key:
             model_id, block_name = target_key.split("/", 1)
             if model_id in active_instance.models:
-                active_instance.gpu_unload_blocks(model_id, block_name)
+                try:
+                    active_instance.gpu_unload_blocks(model_id, block_name)
+                except Exception:
+                    pass
         else:
             model_id = target_key
             if model_id in active_instance.models:
-                active_instance.gpu_unload_blocks(model_id, None)
-                if hasattr(active_instance, "preloaded_blocks_per_model"):
-                    for b in list(active_instance.preloaded_blocks_per_model.get(model_id, ())):
-                        try:
-                            active_instance.gpu_unload_blocks(model_id, b)
-                        except Exception:
-                            pass
-                if hasattr(active_instance, "loaded_blocks") and active_instance.loaded_blocks.get(model_id):
-                    active_instance.gpu_unload_blocks(model_id, active_instance.loaded_blocks[model_id])
-                    active_instance.loaded_blocks[model_id] = None
+                # 1. Nyahmuat base model
+                try:
+                    active_instance.gpu_unload_blocks(model_id, None)
+                except Exception:
+                    pass
+                # 2. Nyahmuat semua blok submodul berdaftar untuk model ini
                 if hasattr(active_instance, "blocks_of_modules") and active_instance.blocks_of_modules:
                     for entry_name in list(active_instance.blocks_of_modules.keys()):
                         if entry_name.startswith(model_id + "/"):
@@ -966,54 +851,35 @@ def safe_mmgp_unload(active_instance, target_key):
                                 active_instance.gpu_unload_blocks(model_id, b_name)
                             except Exception:
                                 pass
+                # 3. Nyahmuat sebarang pra-muat (preloaded blocks)
+                if hasattr(active_instance, "preloaded_blocks_per_model"):
+                    for b in list(active_instance.preloaded_blocks_per_model.get(model_id, ())):
+                        try:
+                            active_instance.gpu_unload_blocks(model_id, b)
+                        except Exception:
+                            pass
+                # 4. Kosongkan blok semasa yang dimuatkan
+                if hasattr(active_instance, "loaded_blocks") and active_instance.loaded_blocks.get(model_id):
+                    try:
+                        active_instance.gpu_unload_blocks(model_id, active_instance.loaded_blocks[model_id])
+                    except Exception:
+                        pass
+                    active_instance.loaded_blocks[model_id] = None
+                # 5. Selesaikan pemindahan yang sedang dalam perjalanan (inflight)
                 if hasattr(active_instance, "inflight"):
                     for entry in [e for e in list(active_instance.inflight.keys()) if e.startswith(model_id + "/")]:
                         try:
                             active_instance.gpu_unload_blocks(model_id, entry[len(model_id) + 1:])
                         except Exception:
                             pass
-                # Lepaskan VRAM slot buffer dan slot views modul ini dari MMGP
-                if hasattr(active_instance, "block_slots") and model_id in active_instance.block_slots:
-                    slots = active_instance.block_slots.pop(model_id, None)
-                    if slots:
-                        for s in slots:
-                            if isinstance(s, list) and len(s) > 0 and s[0] is not None:
-                                s[0] = None
-                if hasattr(active_instance, "slot_views") and active_instance.slot_views:
-                    active_instance.slot_views = {k: v for k, v in active_instance.slot_views.items() if not k[0].startswith(model_id + "/") and k[0] != model_id}
-                if hasattr(active_instance, "auto_preload") and active_instance.auto_preload is not None:
+                if hasattr(active_instance, "wait_prefetch"):
                     try:
-                        active_instance.auto_preload.on_unload([model_id])
+                        active_instance.wait_prefetch()
                     except Exception:
                         pass
-                # Pindahkan sebarang parameter dan buffer CUDA modul ini ke CPU secara selamat
-                m_obj = active_instance.models.get(model_id)
-                if m_obj is not None and hasattr(m_obj, "parameters"):
-                    for p in m_obj.parameters():
-                        if p is not None and getattr(p, "is_cuda", False):
-                            try:
-                                p.data = p.data.to("cpu")
-                            except Exception:
-                                pass
-                    for b in m_obj.buffers():
-                        if b is not None and getattr(b, "is_cuda", False):
-                            try:
-                                b.data = b.data.to("cpu")
-                            except Exception:
-                                pass
-                # Segerakkan active_models_ids dan active_models secara dinamik:
-                if hasattr(active_instance, "active_models_ids"):
-                    while model_id in active_instance.active_models_ids:
-                        active_instance.active_models_ids.remove(model_id)
-                if hasattr(active_instance, "active_models"):
-                    m_obj = active_instance.models.get(model_id)
-                    while m_obj in active_instance.active_models:
-                        active_instance.active_models.remove(m_obj)
-                try:
-                    from mmgp.allocator import ram as mmgp_ram
-                    mmgp_ram.release()
-                except Exception:
-                    pass
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                flush_vram()
                 if torch.cuda.is_available():
                     _alloc_mb = torch.cuda.memory_allocated() / 1048576
                     _res_mb = torch.cuda.memory_reserved() / 1048576
@@ -3560,11 +3426,10 @@ try:
                         dyn_scale = float(_generation_state.get("token_scaling_ratio", 1.0))
                         log_debug(f"[MMGP STATE MACHINE] Fasa 2 Dikesan: Menala MMGP ke Mod Aliran Bersiri (Nisbah Skala={dyn_scale})...")
                         retune_active_model_dynamically(self, phase=2, token_scaling_ratio=dyn_scale)
-            elif model_id in ('vae', 'video_decoder', 'audio_decoder', 'vocoder', 'audio_vae'):
-                log_debug("[MMGP STATE MACHINE] Fasa VAE / Audio Dikesan: Mengosongkan transformer 100% dari VRAM...")
+            elif model_id in ('vae', 'video_decoder', 'audio_decoder', 'vocoder'):
+                log_debug("[MMGP STATE MACHINE] Fasa VAE Dikesan: Mengosongkan transformer 100% dari VRAM...")
                 self.unload_all()
                 flush_vram()
-                force_pagefile_push()
                 _generation_state["phase"] = 1
                 _generation_state["stage1_done"] = False
                 _generation_state["transformer_seen"] = 0
@@ -4555,35 +4420,29 @@ try:
             log_debug("[MINIMAX H3 LIFECYCLE] Fasa 2 (Denoising) selesai! Melupuskan transformer & LoRAs dari VRAM & melepaskan RAM hos...")
             try:
                 safe_mmgp_unload(active_inst, "transformer")
-                active_inst.unload_all()
             except Exception:
                 pass
-        try:
-            from shared.cuda_memory import release_ram_cache
-            release_ram_cache()
-            from mmgp.allocator import ram as mmgp_ram
-            mmgp_ram.release()
-        except Exception:
-            pass
         flush_vram()
-        force_pagefile_push(force_trim=False)
-        trim_current_process_working_set()
 
         # On-Demand: Muatkan semula bobot Video VAE decoder jika telah disingkirkan ke disk
         dec_p = next(self.decoder.parameters(), None) if hasattr(self, "decoder") else None
         if dec_p is not None and dec_p.numel() == 0:
             reload_h3_video_vae_decoder(self)
 
-        # Penyelarasan Peranti: Biarkan MMGP offload menstrim blok decoder ke GPU mengikut keperluan blok demi blok (Sifar Memory Corruption / Sifar Access Violation)
+        # Penyelarasan Peranti: Biarkan MMGP offload menstrim blok decoder ke GPU mengikut keperluan blok demi blok
         video_input = args[0] if len(args) > 0 else kwargs.get("latents") or kwargs.get("video") or kwargs.get("x")
 
         # KONTINUUM PEMULIHAN (SSD LATENT CHECKPOINT DUMP):
-        # Simpan laten siap 100% denoising ke SSD sebelum fasa VAE bermula.
         recovery_dir = os.path.join("workspaces", "recovery")
         recovery_path = os.path.join(recovery_dir, "minimax_last_denoised_latents.pt")
         try:
             os.makedirs(recovery_dir, exist_ok=True)
             if video_input is not None and torch.is_tensor(video_input):
+                v_nan = torch.isnan(video_input).sum().item()
+                v_min = video_input.min().item()
+                v_max = video_input.max().item()
+                v_mean = video_input.float().mean().item()
+                log_debug(f"[VAE DECODE TELEMETRI] Input Laten Video: shape={list(video_input.shape)}, min={v_min:.4f}, max={v_max:.4f}, mean={v_mean:.4f}, NaNs={v_nan}")
                 uint8_r = args[1] if len(args) > 1 else kwargs.get("uint8_rounding", True)
                 torch.save({
                     "video": video_input.detach().cpu(),
@@ -4597,11 +4456,21 @@ try:
 
         try:
             res = universal_auto_healing_call(_orig_h3_vae_decode, self, *args, **kwargs)
-            # Penyahkodan berjaya menghasilkan video -> padam checkpoint pemulihan
-            if os.path.exists(recovery_path):
+            # Semak kualiti keluaran video yang dinyahkod
+            is_black = False
+            if torch.is_tensor(res):
+                r_max = res.float().abs().max().item()
+                r_mean = res.float().mean().item()
+                log_debug(f"[VAE DECODE TELEMETRI] Output Video Terhasil: shape={list(res.shape)}, max={r_max:.4f}, mean={r_mean:.4f}")
+                if r_max == 0.0:
+                    is_black = True
+                    log_debug("[AMARAN KONTINUUM] Video hasil VAE adalah skrin hitam mutlak (max=0.0)! Fail pemulihan dikekalkan di SSD untuk diagnosis.")
+
+            # Hanya padam fail pemulihan jika video TIDAK hitam
+            if not is_black and os.path.exists(recovery_path):
                 try:
                     os.remove(recovery_path)
-                    log_debug("[KONTINUUM PEMULIHAN] Video berjaya dihasilkan, fail pemulihan sementara dipadam bersih.")
+                    log_debug("[KONTINUUM PEMULIHAN] Video sah berjaya dihasilkan, fail pemulihan sementara dipadam bersih.")
                 except Exception:
                     pass
             return res
@@ -4615,19 +4484,9 @@ try:
                     safe_mmgp_unload(active_inst, "vae")
                 except Exception:
                     pass
-            # Alihkan modul decoder kembali ke CPU bagi membebaskan VRAM tanpa merosakkan tensor
-            evict_module_weights(getattr(self, "decoder", None))
-            evict_module_weights(getattr(self, "post_quant_conv", None))
             flush_vram()
             gc.collect()
-            try:
-                from shared.cuda_memory import release_ram_cache
-                release_ram_cache()
-            except Exception:
-                pass
-            trim_current_process_working_set()
             log_debug("[MINIMAX H3 LIFECYCLE] Fasa 3 (Video VAE Decode) selesai! VAE Decoder dialihkan ke RAM hos (Zero Leak).")
-
     h3_video_vae.MiniMaxH3VideoVAE.decode = _safe_h3_vae_decode
 
     # Interceptor On-Demand untuk Video VAE Encoder (digunakan hanya semasa input video/imej fasa awal)
@@ -4763,7 +4622,6 @@ try:
         audio_input = args[0] if len(args) > 0 else kwargs.get("audio") or kwargs.get("x") or kwargs.get("latents")
         if audio_input is not None and torch.is_tensor(audio_input):
             if audio_input.ndim == 3:
-                # Menyelaras secara automatik latents audio 3D [1, channels, frames] -> 4D stereo [1, channels, 2, frames]
                 audio_input = audio_input.unsqueeze(2).repeat(1, 1, 2, 1)
                 if len(args) > 0:
                     args = (audio_input,) + args[1:]
@@ -4793,16 +4651,7 @@ try:
             evict_module_weights(self)
             flush_vram()
             gc.collect()
-            try:
-                from shared.cuda_memory import release_ram_cache
-                release_ram_cache()
-                from mmgp.allocator import ram as mmgp_ram
-                mmgp_ram.release()
-            except Exception:
-                pass
-            trim_current_process_working_set()
             log_debug("[MINIMAX H3 LIFECYCLE] Fasa 3 (Audio VAE Decode) selesai! Audio VAE dialihkan ke RAM hos (Zero Leak).")
-
     h3_audio_vae.MiniMaxH3AudioVAE.decode = _safe_h3_audio_vae_decode
 
     _orig_h3_audio_vae_encode = getattr(h3_audio_vae.MiniMaxH3AudioVAE, "encode", None)
@@ -5070,6 +4919,134 @@ try:
     log_debug("Perisai 10: MiniMax H3 Token Refiner Auto-Eviction & Proactive Forward Shield berjaya dipasang.")
 
     # ----------------------------------------------------------------------
+    # --------------------------------------------------------------------------
+    # PERISAI 10b: Universal Transparent Cutout Auto-Crop & MSR Geometric Preserver
+    # Memelihara geometri subjek (anti-herotan / anti-fat) untuk imej rujukan bertelus (alpha)
+    # Merangkumi LTX-2 (_msr_ref_image_to_frame), MiniMax H3, dan Wan2GP (fit_image_into_canvas)
+    # --------------------------------------------------------------------------
+    try:
+        from PIL import Image as PIL_Image
+        import numpy as np_harmonizer
+
+        def _crop_transparent_margins(img, margin_ratio=0.04):
+            """Mengesan saluran alpha dan memotong ruang kosong lutsinar di sekeliling subjek secara dinamik."""
+            if not isinstance(img, PIL_Image.Image):
+                return img
+            has_alpha = False
+            if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in getattr(img, "info", {})):
+                img = img.convert("RGBA")
+                has_alpha = True
+            if has_alpha:
+                alpha = np_harmonizer.array(img.split()[-1])
+                non_zero = np_harmonizer.where(alpha > 15)
+                if len(non_zero[0]) > 0:
+                    y_min, y_max = int(non_zero[0].min()), int(non_zero[0].max())
+                    x_min, x_max = int(non_zero[1].min()), int(non_zero[1].max())
+                    sub_w = x_max - x_min
+                    sub_h = y_max - y_min
+                    total_area = img.width * img.height
+                    # Jika subjek merangkumi kurang daripada 95% kanvas (wujud ruang kosong lutsinar)
+                    if (sub_w * sub_h) < 0.95 * total_area:
+                        pad_y = int(round(sub_h * margin_ratio))
+                        pad_x = int(round(sub_w * margin_ratio))
+                        y_min_pad = max(0, y_min - pad_y)
+                        y_max_pad = min(img.height, y_max + pad_y)
+                        x_min_pad = max(0, x_min - pad_x)
+                        x_max_pad = min(img.width, x_max + pad_x)
+                        img = img.crop((x_min_pad, y_min_pad, x_max_pad, y_max_pad))
+            return img
+
+        # Pasang pada models.ltx2.ltx2._msr_ref_image_to_frame bagi mengelakkan subjek 'gemuk/herot' pada video menegak/mendatar
+        try:
+            from models.ltx2 import ltx2 as ltx2_mod
+            _orig_msr_frame = ltx2_mod._msr_ref_image_to_frame
+
+            def _harmonized_msr_ref_image_to_frame(ref_image, width: int, height: int):
+                # 1. Ekstrak PIL Image mengikut kaedah rasmi
+                if isinstance(ref_image, str):
+                    with PIL_Image.open(ref_image) as image:
+                        pil_img = image.convert("RGB")
+                elif torch.is_tensor(ref_image):
+                    image = ref_image.detach().cpu()
+                    if image.ndim == 4:
+                        image = image[0]
+                    if image.ndim == 3 and image.shape[0] in (1, 3, 4):
+                        image = image.permute(1, 2, 0)
+                    frame = image.numpy()
+                    if frame.dtype != np_harmonizer.uint8:
+                        if frame.max() <= 1.0:
+                            frame = frame * 255.0
+                        frame = frame.clip(0, 255).astype(np_harmonizer.uint8)
+                    pil_img = PIL_Image.fromarray(frame[..., :3]).convert("RGB")
+                else:
+                    frame = np_harmonizer.array(ref_image)
+                    if frame.dtype != np_harmonizer.uint8:
+                        if frame.max() <= 1.0:
+                            frame = frame * 255.0
+                        frame = frame.clip(0, 255).astype(np_harmonizer.uint8)
+                    pil_img = PIL_Image.fromarray(frame[..., :3]).convert("RGB")
+
+                # 2. Pangkas sempadan lutsinar jika ada
+                pil_img = _crop_transparent_margins(pil_img)
+
+                # 3. Skala seragam (Uniform Scale) mengelakkan herotan 'terlalu gemuk'
+                target_w, target_h = int(width), int(height)
+                img_w, img_h = pil_img.size
+                if img_w <= 0 or img_h <= 0 or target_w <= 0 or target_h <= 0:
+                    return np_harmonizer.array(pil_img.resize((target_w, target_h), PIL_Image.Resampling.LANCZOS))
+
+                scale = min(target_w / img_w, target_h / img_h)
+                new_w = max(1, int(round(img_w * scale)))
+                new_h = max(1, int(round(img_h * scale)))
+                resized = pil_img.resize((new_w, new_h), PIL_Image.Resampling.LANCZOS)
+
+                canvas = PIL_Image.new("RGB", (target_w, target_h), (128, 128, 128))
+                top = (target_h - new_h) // 2
+                left = (target_w - new_w) // 2
+                canvas.paste(resized.convert("RGB"), (left, top))
+                return np_harmonizer.array(canvas)
+
+            ltx2_mod._msr_ref_image_to_frame = _harmonized_msr_ref_image_to_frame
+            log_debug("[ASPECT & CUTOUT HARMONIZER] Pintasan sejagat _msr_ref_image_to_frame untuk LTX-2 (Anti-Fat & Alpha Crop) berjaya dipasang.")
+        except Exception as e_ltx:
+            log_debug(f"[ASPECT & CUTOUT HARMONIZER] Amaran: Pintasan LTX-2 terlepas: {e_ltx}")
+
+        # Pasang juga pada shared.utils.utils.fit_image_into_canvas untuk model lain
+        try:
+            import shared.utils.utils as shared_utils
+            _orig_fit_canvas = shared_utils.fit_image_into_canvas
+
+            @functools.wraps(_orig_fit_canvas)
+            def _harmonized_fit_image_into_canvas(ref_img, image_size, *args, **kwargs):
+                if isinstance(ref_img, PIL_Image.Image):
+                    ref_img = _crop_transparent_margins(ref_img)
+                return _orig_fit_canvas(ref_img, image_size, *args, **kwargs)
+
+            shared_utils.fit_image_into_canvas = _harmonized_fit_image_into_canvas
+            log_debug("[ASPECT & CUTOUT HARMONIZER] Pintasan sejagat fit_image_into_canvas berjaya dipasang.")
+        except Exception as e_fit:
+            log_debug(f"[ASPECT & CUTOUT HARMONIZER] Amaran: Pintasan fit_image_into_canvas terlepas: {e_fit}")
+
+        # Pasang pada MiniMax H3 _prepare_image_reference HANYA untuk auto-crop sempadan alpha (tanpa mengubah saiz kanvas asal)
+        try:
+            import models.minimax_h3.pipeline as h3_pipe
+            _orig_h3_prep_ref = h3_pipe.MiniMaxH3Pipeline._prepare_image_reference
+
+            @functools.wraps(_orig_h3_prep_ref)
+            def _safe_h3_prepare_image_reference(self, image, target_width, target_height, image_refs_relative_size):
+                if image is not None:
+                    if isinstance(image, PIL_Image.Image):
+                        image = _crop_transparent_margins(image)
+                return _orig_h3_prep_ref(self, image, target_width, target_height, image_refs_relative_size)
+
+            h3_pipe.MiniMaxH3Pipeline._prepare_image_reference = _safe_h3_prepare_image_reference
+            log_debug("[ASPECT & CUTOUT HARMONIZER] Pintasan auto-crop alpha MiniMax H3 berjaya dipasang.")
+        except Exception as e_h3:
+            log_debug(f"[ASPECT & CUTOUT HARMONIZER] Amaran: Pintasan MiniMax H3 terlepas: {e_h3}")
+
+    except Exception as e_harm:
+        log_debug(f"[ASPECT & CUTOUT HARMONIZER] Ralat umum: {e_harm}")
+
     # PERISAI 14: MiniMax H3 Universal Phase Lifecycle Manager (Zero Hardcode)
     # Load When Needed, Unload When Done:
     # 1. Pengekodan Teks/Visi Selesai -> Nyahmuat Qwen3-VL 32B (text_encoder/vision_encoder) serta-merta
